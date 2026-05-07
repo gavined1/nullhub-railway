@@ -158,11 +158,22 @@ pub const Server = struct {
         };
         defer self.allocator.free(desired_binary);
 
-        var desired_launch = launch_args_mod.resolve(self.allocator, entry.launch_mode, entry.verbose) catch {
+        const launch_mode = normalizedLaunchModeForRestore(component, entry.launch_mode);
+        var desired_launch = launch_args_mod.resolve(self.allocator, launch_mode, entry.verbose) catch {
             self.terminatePersistedRuntime(&runtime, component, name);
             return false;
         };
         defer desired_launch.deinit();
+
+        if (!std.mem.eql(u8, launch_mode, entry.launch_mode)) {
+            _ = self.state.updateInstance(component, name, .{
+                .version = entry.version,
+                .auto_start = entry.auto_start,
+                .launch_mode = launch_mode,
+                .verbose = entry.verbose,
+            }) catch {};
+            self.state.save() catch {};
+        }
 
         if (!persistedMatchesDesired(runtime, desired_binary, desired_launch.primary_command, desired_launch.argv)) {
             self.terminatePersistedRuntime(&runtime, component, name);
@@ -172,6 +183,17 @@ pub const Server = struct {
         const restored = self.manager.adoptInstance(component, name, runtime) catch return false;
         if (!restored) runtime_state_mod.delete(self.allocator, self.paths, component, name);
         return restored;
+    }
+
+    fn normalizedLaunchModeForRestore(component: []const u8, launch_mode: []const u8) []const u8 {
+        const known = registry.findKnownComponent(component) orelse return launch_mode;
+        if (!std.mem.eql(u8, known.default_launch_command, "gateway") and std.mem.eql(u8, launch_mode, "gateway")) {
+            return known.default_launch_command;
+        }
+        if (std.mem.eql(u8, component, "nullwatch") and std.mem.eql(u8, launch_mode, "nullwatch")) {
+            return known.default_launch_command;
+        }
+        return launch_mode;
     }
 
     fn terminatePersistedRuntime(
@@ -1796,6 +1818,54 @@ test "reconcileInstancesOnBoot terminates mismatched persisted runtime without r
     const contents = try file.readToEndAlloc(allocator, 1024);
     defer allocator.free(contents);
     try std.testing.expectEqualStrings("started\n", contents);
+}
+
+test "reconcileInstancesOnBoot adopts legacy nullwatch launch mode as serve" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var ctx = TestContext.init(allocator);
+    defer ctx.deinit(allocator);
+    try ctx.paths.ensureDirs();
+
+    const binary_path = try ctx.paths.binary(allocator, "nullwatch", "1.0.0");
+    defer allocator.free(binary_path);
+
+    try ctx.state.addInstance("nullwatch", "watch", .{
+        .version = "1.0.0",
+        .auto_start = false,
+        .launch_mode = "gateway",
+    });
+
+    var launch = try launch_args_mod.resolve(allocator, "serve", false);
+    defer launch.deinit();
+
+    const spawned = try process_mod.spawn(allocator, .{
+        .binary = "/bin/sleep",
+        .argv = &.{"60"},
+    });
+
+    try runtime_state_mod.write(allocator, ctx.paths, "nullwatch", "watch", .{
+        .pid = process_mod.persistedPidValue(spawned.pid).?,
+        .port = 0,
+        .health_endpoint = "/health",
+        .binary_path = binary_path,
+        .launch_command = launch.primary_command,
+        .launch_args = launch.argv,
+        .started_at = std_compat.time.milliTimestamp(),
+        .starting_since = std_compat.time.milliTimestamp(),
+    });
+
+    ctx.reconcileInstancesOnBoot();
+
+    const status = ctx.manager.getStatus("nullwatch", "watch").?;
+    try std.testing.expectEqual(manager_mod.Status.running, status.status);
+    try std.testing.expect(process_mod.isAlive(spawned.pid));
+    try std.testing.expectEqualStrings("serve", ctx.state.getInstance("nullwatch", "watch").?.launch_mode);
+
+    ctx.manager.stopInstance("nullwatch", "watch") catch {};
+    _ = spawned.child.wait() catch {};
 }
 
 test "route GET /api/status returns version and platform" {

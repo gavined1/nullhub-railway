@@ -121,8 +121,11 @@
   let standaloneHomePath = $derived(`$NULLHUB_HOME/instances/${component}/${name}`);
   let standaloneConfigPath = $derived(`${standaloneHomePath}/config.json`);
   let hasStandaloneBinary = $derived(Boolean(instance?.version && instance.version !== "standalone"));
+  let standaloneBinaryName = $derived(
+    hasStandaloneBinary ? managedBinaryName(component, instance.version) : "",
+  );
   let standaloneBinaryPath = $derived(
-    hasStandaloneBinary ? `$NULLHUB_HOME/bin/${component}-${instance.version}` : "",
+    standaloneBinaryName ? `$NULLHUB_HOME/bin/${standaloneBinaryName}` : "",
   );
   let standaloneLaunchScript = $derived(
     hasStandaloneBinary
@@ -292,6 +295,12 @@
     return "gateway";
   }
 
+  function managedBinaryName(componentName: string, version: string | undefined): string {
+    if (!version) return "";
+    if (version === "dev-local") return componentName;
+    return `${componentName}-${version}`;
+  }
+
   function normalizedLaunchArgs(componentName: string, launchMode: string | undefined): string[] {
     const args = tokenizeLaunchMode(launchMode || defaultLaunchMode(componentName));
     if (args.length === 0) args.push(defaultLaunchMode(componentName));
@@ -324,7 +333,7 @@
     if (verbose) args.push("--verbose");
 
     const command = [
-      `"$NULLHUB_HOME/bin/${componentName}-${version}"`,
+      `"$NULLHUB_HOME/bin/${managedBinaryName(componentName, version)}"`,
       ...args.map(shellQuote),
     ].join(" ");
 
@@ -730,6 +739,9 @@
       {/if}
       <button class="btn" onclick={stop} disabled={loading}>Stop</button>
       <button class="btn" onclick={restart} disabled={loading}>Restart</button>
+      {#if component === "nullwatch"}
+        <a class="btn" href="/observability">Observability</a>
+      {/if}
       <button class="btn danger" onclick={remove} disabled={loading}
         >Delete</button
       >
@@ -1297,6 +1309,9 @@
     gap: 0.75rem;
   }
   .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     padding: 0.5rem 1rem;
     border: 1px solid var(--accent-dim);
     border-radius: 2px;
@@ -1309,6 +1324,7 @@
     cursor: pointer;
     transition: all 0.2s ease;
     text-shadow: var(--text-glow);
+    text-decoration: none;
   }
   .btn:hover {
     background: var(--bg-hover);
