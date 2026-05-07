@@ -9,8 +9,14 @@
   import InstanceHistoryPanel from "$lib/components/InstanceHistoryPanel.svelte";
   import InstanceMemoryPanel from "$lib/components/InstanceMemoryPanel.svelte";
   import InstanceSkillsPanel from "$lib/components/InstanceSkillsPanel.svelte";
+  import NullBoilerPanel from "$lib/components/NullBoilerPanel.svelte";
+  import NullTicketsPanel from "$lib/components/NullTicketsPanel.svelte";
   import { api } from "$lib/api/client";
-  import { orchestrationUiRoutes, withBoilerInstance } from "$lib/orchestration/routes";
+  import {
+    orchestrationUiRoutes,
+    withBoilerInstance,
+    withTicketsInstance,
+  } from "$lib/orchestration/routes";
   import {
     setSelectedBoilerInstance,
     setSelectedTicketsInstance,
@@ -43,6 +49,21 @@
   let trackerClaimRole = $state("coder");
   let trackerSuccessTrigger = $state("complete");
   let trackerConcurrency = $state("1");
+  let ticketsPipelines = $state([] as any[]);
+  let ticketsTasks = $state([] as any[]);
+  let ticketsDataLoading = $state(false);
+  let ticketsDataError = $state("");
+  let ticketsActionMessage = $state("");
+  let ticketsActionError = $state("");
+  let ticketTaskPipeline = $state("");
+  let ticketTaskTitle = $state("");
+  let ticketTaskDescription = $state("");
+  let ticketTaskPriority = $state("0");
+  let ticketClaimAgent = $state("nullhub");
+  let ticketClaimRole = $state("coder");
+  let ticketClaimTtl = $state("300000");
+  let claimedTicket = $state<any>(null);
+  let lastTicketsRefreshAt = $state(0);
 
   let modelName = $derived(extractModel(config));
   let webPort = $derived(extractWebPort(config));
@@ -101,6 +122,8 @@
     component === "nullboiler" || component === "nulltickets",
   );
   let supportsAgentData = $derived(component === "nullclaw");
+  let supportsBoilerUi = $derived(component === "nullboiler");
+  let supportsTicketsUi = $derived(component === "nulltickets");
   let supportsVerboseStartup = $derived(component === "nullclaw");
   let instanceRouteKey = $derived(`${component}/${name}`);
   let initializedRouteKey = $state("");
@@ -411,6 +434,64 @@
     return { roles, claimable, failed, stuck, nearExpiry };
   }
 
+  function normalizeCollectionResult(result: any): any[] {
+    if (Array.isArray(result)) return result;
+    if (Array.isArray(result?.items)) return result.items;
+    if (Array.isArray(result?.tasks)) return result.tasks;
+    if (Array.isArray(result?.pipelines)) return result.pipelines;
+    return [];
+  }
+
+  function pipelineId(pipeline: any): string {
+    return String(pipeline?.id || pipeline?.name || "");
+  }
+
+  function pipelineName(pipeline: any): string {
+    return String(pipeline?.name || pipeline?.id || "pipeline");
+  }
+
+  function taskTitle(task: any): string {
+    return String(task?.title || task?.id || "task");
+  }
+
+  function firstQueueRole(): string {
+    const role = queueSummary.roles.find((item: any) => Number(item?.claimable_count || 0) > 0)?.role ||
+      queueSummary.roles[0]?.role;
+    return typeof role === "string" && role.length > 0 ? role : "coder";
+  }
+
+  async function refreshTicketsData(force = false) {
+    if (component !== "nulltickets") return;
+    if (integration?.instance?.running !== true && instance?.status !== "running") {
+      ticketsPipelines = [];
+      ticketsTasks = [];
+      ticketsDataError = "";
+      return;
+    }
+
+    const now = Date.now();
+    if (!force && now - lastTicketsRefreshAt < 5_000) return;
+    lastTicketsRefreshAt = now;
+    ticketsDataLoading = true;
+    try {
+      const [pipelinesResult, tasksResult] = await Promise.all([
+        api.nullTicketsPipelines(component, name),
+        api.nullTicketsTasks(component, name, { limit: 8 }),
+      ]);
+      ticketsPipelines = normalizeCollectionResult(pipelinesResult);
+      ticketsTasks = normalizeCollectionResult(tasksResult);
+      if (!ticketTaskPipeline || !ticketsPipelines.some((pipeline) => pipelineId(pipeline) === ticketTaskPipeline)) {
+        ticketTaskPipeline = pipelineId(ticketsPipelines[0] || {});
+      }
+      if (!ticketClaimRole) ticketClaimRole = firstQueueRole();
+      ticketsDataError = "";
+    } catch (e) {
+      ticketsDataError = (e as Error).message;
+    } finally {
+      ticketsDataLoading = false;
+    }
+  }
+
   async function refreshIntegration() {
     if (!supportsIntegration) {
       integration = null;
@@ -424,17 +505,26 @@
       integrationError = null;
       if (component === "nullboiler") {
         const currentLink = integration?.current_link;
+        const availableTrackers = Array.isArray(integration?.available_trackers)
+          ? integration.available_trackers
+          : [];
+        const selectedStillAvailable = availableTrackers.some(
+          (tracker: any) => tracker?.name === selectedTracker,
+        );
         selectedTracker =
           integration?.linked_tracker?.name ||
-          selectedTracker ||
-          integration?.available_trackers?.[0]?.name ||
+          (selectedStillAvailable ? selectedTracker : availableTrackers[0]?.name) ||
           "";
-        selectedPipeline = currentLink?.pipeline_id || selectedPipeline || "";
+        selectedPipeline =
+          currentLink?.pipeline_id || (selectedStillAvailable ? selectedPipeline : "") || "";
         trackerClaimRole = currentLink?.claim_role || trackerClaimRole || "coder";
         trackerSuccessTrigger =
           currentLink?.success_trigger || trackerSuccessTrigger || "complete";
         trackerConcurrency =
           String(currentLink?.max_concurrent_tasks || trackerConcurrency || "1");
+      } else if (component === "nulltickets") {
+        if (!ticketClaimRole) ticketClaimRole = firstQueueRole();
+        await refreshTicketsData();
       }
     } catch (e) {
       integration = null;
@@ -458,6 +548,9 @@
       };
       await api.linkIntegration(component, name, payload);
       await refresh();
+      integrationError = null;
+    } catch (e) {
+      integrationError = (e as Error).message;
     } finally {
       linkingIntegration = false;
     }
@@ -472,7 +565,70 @@
   async function openTicketsStore() {
     if (component !== "nulltickets") return;
     setSelectedTicketsInstance(name);
-    await goto(orchestrationUiRoutes.store());
+    await goto(withTicketsInstance(orchestrationUiRoutes.store(), name));
+  }
+
+  async function createTicketTask() {
+    if (component !== "nulltickets") return;
+    const pipeline_id = ticketTaskPipeline.trim();
+    const title = ticketTaskTitle.trim();
+    if (!pipeline_id || !title) return;
+
+    ticketsDataLoading = true;
+    ticketsActionError = "";
+    ticketsActionMessage = "";
+    try {
+      const priority = Number.parseInt(ticketTaskPriority || "0", 10);
+      const result = await api.nullTicketsCreateTask(component, name, {
+        pipeline_id,
+        title,
+        description: ticketTaskDescription.trim(),
+        priority: Number.isFinite(priority) ? priority : 0,
+        metadata: { source: "nullhub-ui" },
+        assigned_by: "nullhub",
+      });
+      ticketTaskTitle = "";
+      ticketTaskDescription = "";
+      claimedTicket = null;
+      ticketsActionMessage = `Task ${result?.id || ""} created`.trim();
+      await refreshIntegration();
+      await refreshTicketsData(true);
+    } catch (e) {
+      ticketsActionError = (e as Error).message;
+    } finally {
+      ticketsDataLoading = false;
+    }
+  }
+
+  async function claimTicketTask() {
+    if (component !== "nulltickets") return;
+    const agent_id = ticketClaimAgent.trim() || "nullhub";
+    const agent_role = ticketClaimRole.trim() || "coder";
+    const lease_ttl_ms = Math.max(1000, Number.parseInt(ticketClaimTtl || "300000", 10) || 300000);
+
+    ticketsDataLoading = true;
+    ticketsActionError = "";
+    ticketsActionMessage = "";
+    try {
+      const result = await api.nullTicketsClaimTask(component, name, {
+        agent_id,
+        agent_role,
+        lease_ttl_ms,
+      });
+      if (result?.task) {
+        claimedTicket = result;
+        ticketsActionMessage = `Claimed ${result.task.id || "task"}`;
+      } else {
+        claimedTicket = null;
+        ticketsActionMessage = "No claimable task";
+      }
+      await refreshIntegration();
+      await refreshTicketsData(true);
+    } catch (e) {
+      ticketsActionError = (e as Error).message;
+    } finally {
+      ticketsDataLoading = false;
+    }
   }
 
   async function refreshProviderHealth(cfgOverride: any = config) {
@@ -604,6 +760,12 @@
     ) {
       activeTab = "overview";
     }
+    if (activeTab === "tickets" && !supportsTicketsUi) {
+      activeTab = "overview";
+    }
+    if (activeTab === "boiler" && !supportsBoilerUi) {
+      activeTab = "overview";
+    }
   });
 
   $effect(() => {
@@ -628,6 +790,26 @@
     usageData = null;
     integration = null;
     integrationError = null;
+    linkingIntegration = false;
+    selectedTracker = "";
+    selectedPipeline = "";
+    trackerClaimRole = "coder";
+    trackerSuccessTrigger = "complete";
+    trackerConcurrency = "1";
+    ticketsPipelines = [];
+    ticketsTasks = [];
+    ticketsDataError = "";
+    ticketsActionError = "";
+    ticketsActionMessage = "";
+    ticketTaskPipeline = "";
+    ticketTaskTitle = "";
+    ticketTaskDescription = "";
+    ticketTaskPriority = "0";
+    ticketClaimAgent = "nullhub";
+    ticketClaimRole = "coder";
+    ticketClaimTtl = "300000";
+    claimedTicket = null;
+    lastTicketsRefreshAt = 0;
     onboardingStatus = null;
     bootstrapChatAutoOpenedFor = "";
     lastUsageRefreshAt = 0;
@@ -765,6 +947,18 @@
         onclick={() => (activeTab = "skills")}>Skills</button
       >
     {/if}
+    {#if supportsTicketsUi}
+      <button
+        class:active={activeTab === "tickets"}
+        onclick={() => (activeTab = "tickets")}>Tickets</button
+      >
+    {/if}
+    {#if supportsBoilerUi}
+      <button
+        class:active={activeTab === "boiler"}
+        onclick={() => (activeTab = "boiler")}>Boiler</button
+      >
+    {/if}
     <button
       class:active={activeTab === "config"}
       onclick={() => (activeTab = "config")}>Config</button
@@ -887,11 +1081,28 @@
               <span class="integration-error">{integrationError}</span>
             {:else if component === "nullboiler"}
               <div class="integration-block">
+                <span class="integration-title">NullBoiler</span>
+                <span class="mono">
+                  {integration?.instance?.name || name}:{integration?.instance?.port || instance?.port || "-"}
+                </span>
+                {#if integration?.instance?.running === true}
+                  <span class="integration-badge">Running</span>
+                {:else if integration?.instance?.running === false}
+                  <span class="integration-muted">Stopped</span>
+                {/if}
+              </div>
+
+              <div class="integration-block">
                 <span class="integration-title">Tracker</span>
                 {#if integration?.linked_tracker}
                   <span class="mono"
                     >{integration.linked_tracker.name}:{integration.linked_tracker.port}</span
                   >
+                {:else if integration?.configured_tracker?.url}
+                  <span class="mono">{integration.configured_tracker.url}</span>
+                  <span class="integration-muted">No matching local NullTickets instance.</span>
+                {:else if integration?.configured}
+                  <span class="integration-muted">Tracker config exists without a target URL.</span>
                 {:else}
                   <span class="integration-muted">No tracker linked yet.</span>
                 {/if}
@@ -1046,6 +1257,18 @@
               </div>
             {:else}
               <div class="integration-block">
+                <span class="integration-title">Tracker</span>
+                <span class="mono">
+                  {integration?.instance?.name || name}:{integration?.instance?.port || instance?.port || "-"}
+                </span>
+                {#if integration?.instance?.running === true}
+                  <span class="integration-badge">Running</span>
+                {:else if integration?.instance?.running === false}
+                  <span class="integration-muted">Stopped</span>
+                {/if}
+              </div>
+
+              <div class="integration-block">
                 <span class="integration-title">Queue</span>
                 {#if queueSummary.roles.length > 0}
                   <div class="integration-stats compact">
@@ -1075,7 +1298,121 @@
                 <button class="btn integration-btn" onclick={openTicketsStore}>
                   Store
                 </button>
+                <button
+                  class="btn integration-btn"
+                  onclick={() => refreshTicketsData(true)}
+                  disabled={ticketsDataLoading || integration?.instance?.running !== true}
+                >
+                  {ticketsDataLoading ? "Refreshing..." : "Refresh"}
+                </button>
               </div>
+
+              {#if ticketsDataError}
+                <span class="integration-error">{ticketsDataError}</span>
+              {/if}
+              {#if ticketsActionError}
+                <span class="integration-error">{ticketsActionError}</span>
+              {:else if ticketsActionMessage}
+                <span class="integration-muted">{ticketsActionMessage}</span>
+              {/if}
+
+              <div class="integration-block">
+                <span class="integration-title">Task Actions</span>
+                <div class="integration-form">
+                  <label class="integration-field">
+                    <span>Pipeline</span>
+                    {#if ticketsPipelines.length > 0}
+                      <select bind:value={ticketTaskPipeline} disabled={ticketsDataLoading}>
+                        {#each ticketsPipelines as pipeline}
+                          <option value={pipelineId(pipeline)}>
+                            {pipelineName(pipeline)} ({pipelineId(pipeline)})
+                          </option>
+                        {/each}
+                      </select>
+                    {:else}
+                      <input bind:value={ticketTaskPipeline} placeholder="pipeline-id" />
+                    {/if}
+                  </label>
+                  <label class="integration-field">
+                    <span>Title</span>
+                    <input bind:value={ticketTaskTitle} placeholder="Task title" />
+                  </label>
+                  <label class="integration-field">
+                    <span>Priority</span>
+                    <input bind:value={ticketTaskPriority} inputmode="numeric" />
+                  </label>
+                  <label class="integration-field wide">
+                    <span>Description</span>
+                    <textarea bind:value={ticketTaskDescription} rows="3"></textarea>
+                  </label>
+                  <button
+                    class="btn integration-btn"
+                    onclick={createTicketTask}
+                    disabled={ticketsDataLoading || integration?.instance?.running !== true || !ticketTaskPipeline.trim() || !ticketTaskTitle.trim()}
+                  >
+                    Create Task
+                  </button>
+                </div>
+              </div>
+
+              <div class="integration-block">
+                <span class="integration-title">Claim Next</span>
+                <div class="integration-form">
+                  <label class="integration-field">
+                    <span>Agent</span>
+                    <input bind:value={ticketClaimAgent} placeholder="nullhub" />
+                  </label>
+                  <label class="integration-field">
+                    <span>Role</span>
+                    {#if queueSummary.roles.length > 0}
+                      <select bind:value={ticketClaimRole} disabled={ticketsDataLoading}>
+                        {#each queueSummary.roles as role}
+                          <option value={role.role}>
+                            {role.role} ({role.claimable_count || 0})
+                          </option>
+                        {/each}
+                      </select>
+                    {:else}
+                      <input bind:value={ticketClaimRole} placeholder="coder" />
+                    {/if}
+                  </label>
+                  <label class="integration-field">
+                    <span>Lease TTL ms</span>
+                    <input bind:value={ticketClaimTtl} inputmode="numeric" />
+                  </label>
+                  <button
+                    class="btn integration-btn"
+                    onclick={claimTicketTask}
+                    disabled={ticketsDataLoading || integration?.instance?.running !== true || !ticketClaimRole.trim()}
+                  >
+                    Claim Task
+                  </button>
+                </div>
+                {#if claimedTicket?.task}
+                  <span class="integration-muted">
+                    {taskTitle(claimedTicket.task)} - <span class="mono">{claimedTicket.lease_id}</span>
+                  </span>
+                {/if}
+              </div>
+
+              {#if ticketsTasks.length > 0}
+                <div class="integration-block">
+                  <span class="integration-title">Recent Tasks</span>
+                  <div class="integration-list">
+                    {#each ticketsTasks.slice(0, 6) as task}
+                      <div class="integration-list-item">
+                        <div>
+                          <span class="integration-title">{taskTitle(task)}</span>
+                          <span class="integration-muted mono"> {task.id || ""}</span>
+                        </div>
+                        <span class="integration-muted"
+                          >{task.stage || "-"} / {task.pipeline_id || "-"}</span
+                        >
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
 
               {#if linkedBoilers.length > 0}
                 <div class="integration-list">
@@ -1161,6 +1498,24 @@
     {:else if activeTab === "skills"}
       {#key instanceRouteKey}
         <InstanceSkillsPanel {component} {name} active={activeTab === "skills"} />
+      {/key}
+    {:else if activeTab === "tickets"}
+      {#key instanceRouteKey}
+        <NullTicketsPanel
+          {component}
+          {name}
+          active={activeTab === "tickets"}
+          running={integration?.instance?.running === true || instance?.status === "running"}
+        />
+      {/key}
+    {:else if activeTab === "boiler"}
+      {#key instanceRouteKey}
+        <NullBoilerPanel
+          {component}
+          {name}
+          active={activeTab === "boiler"}
+          running={integration?.instance?.running === true || instance?.status === "running"}
+        />
       {/key}
     {:else if activeTab === "config"}
       {#key instanceRouteKey}
@@ -1489,6 +1844,9 @@
     flex-direction: column;
     gap: 0.4rem;
   }
+  .integration-field.wide {
+    grid-column: 1 / -1;
+  }
   .integration-field span {
     color: var(--accent-dim);
     font-size: 0.6875rem;
@@ -1496,7 +1854,8 @@
     letter-spacing: 1px;
   }
   .integration-field select,
-  .integration-field input {
+  .integration-field input,
+  .integration-field textarea {
     padding: 0.6rem 0.7rem;
     border: 1px solid var(--border);
     border-radius: 2px;
@@ -1506,9 +1865,14 @@
     font-size: 0.8rem;
   }
   .integration-field select:focus,
-  .integration-field input:focus {
+  .integration-field input:focus,
+  .integration-field textarea:focus {
     outline: none;
     border-color: var(--accent);
+  }
+  .integration-field textarea {
+    min-height: 84px;
+    resize: vertical;
   }
   .integration-btn {
     min-height: 42px;

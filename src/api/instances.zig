@@ -83,6 +83,233 @@ fn buildInstanceUrl(allocator: std.mem.Allocator, port: u16, path: []const u8) ?
     return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}{s}", .{ port, path }) catch null;
 }
 
+const NullTicketsActionRequest = struct {
+    method: ?[]const u8 = null,
+    path: []const u8,
+    payload: ?std.json.Value = null,
+    bearer_token: ?[]const u8 = null,
+};
+
+fn parseNullTicketsActionMethod(method: []const u8) ?std.http.Method {
+    if (std.mem.eql(u8, method, "GET")) return .GET;
+    if (std.mem.eql(u8, method, "POST")) return .POST;
+    if (std.mem.eql(u8, method, "DELETE")) return .DELETE;
+    return null;
+}
+
+fn actionStatus(code: u10) []const u8 {
+    return switch (code) {
+        200 => "200 OK",
+        201 => "201 Created",
+        204 => "204 No Content",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        405 => "405 Method Not Allowed",
+        409 => "409 Conflict",
+        410 => "410 Gone",
+        422 => "422 Unprocessable Entity",
+        500 => "500 Internal Server Error",
+        502 => "502 Bad Gateway",
+        503 => "503 Service Unavailable",
+        else => if (code >= 200 and code < 300) "200 OK" else if (code >= 400 and code < 500) "400 Bad Request" else "500 Internal Server Error",
+    };
+}
+
+fn hasUnsafeActionPathByte(path: []const u8) bool {
+    for (path) |ch| {
+        if (ch <= 0x20 or ch == 0x7f) return true;
+    }
+    return false;
+}
+
+fn hasSinglePathTail(path: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    const tail = path[prefix.len..];
+    return tail.len > 0 and std.mem.indexOfScalar(u8, tail, '/') == null;
+}
+
+fn isTaskSubpath(path: []const u8, suffix: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "/tasks/")) return false;
+    if (!std.mem.endsWith(u8, path, suffix)) return false;
+    const tail = path["/tasks/".len .. path.len - suffix.len];
+    return tail.len > 0 and std.mem.indexOfScalar(u8, tail, '/') == null;
+}
+
+fn isTaskAssignmentTarget(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "/tasks/")) return false;
+    const tail = path["/tasks/".len..];
+    const slash = std.mem.indexOfScalar(u8, tail, '/') orelse return false;
+    const task_id = tail[0..slash];
+    const rest = tail[slash + 1 ..];
+    if (task_id.len == 0) return false;
+    if (!std.mem.startsWith(u8, rest, "assignments/")) return false;
+    const agent_id = rest["assignments/".len..];
+    return agent_id.len > 0 and std.mem.indexOfScalar(u8, agent_id, '/') == null;
+}
+
+fn isRunSubpath(path: []const u8, suffix: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "/runs/")) return false;
+    if (!std.mem.endsWith(u8, path, suffix)) return false;
+    const tail = path["/runs/".len .. path.len - suffix.len];
+    return tail.len > 0 and std.mem.indexOfScalar(u8, tail, '/') == null;
+}
+
+fn isLeaseHeartbeatTarget(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "/leases/")) return false;
+    if (!std.mem.endsWith(u8, path, "/heartbeat")) return false;
+    const lease_id = path["/leases/".len .. path.len - "/heartbeat".len];
+    return lease_id.len > 0 and std.mem.indexOfScalar(u8, lease_id, '/') == null;
+}
+
+fn isLeaseScopedNullTicketsAction(method: std.http.Method, path: []const u8) bool {
+    if (method != .POST) return false;
+    const clean = stripQuery(path);
+    if (path.len != clean.len) return false;
+    return isLeaseHeartbeatTarget(clean) or
+        isRunSubpath(clean, "/events") or
+        isRunSubpath(clean, "/transition") or
+        isRunSubpath(clean, "/fail");
+}
+
+fn isAllowedNullTicketsAction(method: std.http.Method, path: []const u8) bool {
+    if (path.len == 0 or path.len > 2048) return false;
+    if (path[0] != '/') return false;
+    if (std.mem.startsWith(u8, path, "//")) return false;
+    if (std.mem.indexOfScalar(u8, path, '#') != null) return false;
+    if (hasUnsafeActionPathByte(path)) return false;
+
+    const clean = stripQuery(path);
+    return switch (method) {
+        .GET => std.mem.eql(u8, clean, "/pipelines") or
+            hasSinglePathTail(clean, "/pipelines/") or
+            std.mem.eql(u8, clean, "/tasks") or
+            hasSinglePathTail(clean, "/tasks/") or
+            isTaskSubpath(clean, "/run-state") or
+            isTaskSubpath(clean, "/dependencies") or
+            isTaskSubpath(clean, "/assignments") or
+            isRunSubpath(clean, "/events") or
+            std.mem.eql(u8, clean, "/artifacts") or
+            std.mem.eql(u8, clean, "/ops/queue"),
+        .POST => path.len == clean.len and
+            (std.mem.eql(u8, clean, "/pipelines") or
+                std.mem.eql(u8, clean, "/tasks") or
+                std.mem.eql(u8, clean, "/tasks/bulk") or
+                isTaskSubpath(clean, "/dependencies") or
+                isTaskSubpath(clean, "/assignments") or
+                std.mem.eql(u8, clean, "/leases/claim") or
+                isLeaseHeartbeatTarget(clean) or
+                isRunSubpath(clean, "/events") or
+                isRunSubpath(clean, "/transition") or
+                isRunSubpath(clean, "/fail") or
+                std.mem.eql(u8, clean, "/artifacts")),
+        .DELETE => path.len == clean.len and isTaskAssignmentTarget(clean),
+        else => false,
+    };
+}
+
+fn handleNullTicketsAction(
+    allocator: std.mem.Allocator,
+    s: *state_mod.State,
+    manager: *manager_mod.Manager,
+    mutex: *std_compat.sync.Mutex,
+    paths: paths_mod.Paths,
+    component: []const u8,
+    name: []const u8,
+    body: []const u8,
+) ApiResponse {
+    if (!std.mem.eql(u8, component, "nulltickets")) {
+        return badRequest("{\"error\":\"tickets actions are only supported for nulltickets\"}");
+    }
+
+    var parsed = std.json.parseFromSlice(NullTicketsActionRequest, allocator, body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return badRequest("{\"error\":\"invalid JSON body\"}");
+    defer parsed.deinit();
+
+    const method_name = parsed.value.method orelse "GET";
+    const http_method = parseNullTicketsActionMethod(method_name) orelse
+        return methodNotAllowed();
+    if (!isAllowedNullTicketsAction(http_method, parsed.value.path)) {
+        return badRequest("{\"error\":\"unsupported nulltickets action\"}");
+    }
+
+    var tickets_cfg = blk: {
+        mutex.lock();
+        defer mutex.unlock();
+        _ = s.getInstance(component, name) orelse return notFound();
+        const runtime = manager.getStatus("nulltickets", name) orelse
+            return conflict("{\"error\":\"nulltickets instance is not running\"}");
+        if (runtime.status != .running) {
+            return conflict("{\"error\":\"nulltickets instance is not running\"}");
+        }
+        break :blk integration_mod.loadNullTicketsConfig(allocator, paths, name) catch null orelse return notFound();
+    };
+    defer integration_mod.deinitNullTicketsConfig(allocator, &tickets_cfg);
+
+    var payload_json: ?[]u8 = null;
+    defer if (payload_json) |value| allocator.free(value);
+    if (parsed.value.payload) |payload| {
+        payload_json = std.json.Stringify.valueAlloc(allocator, payload, .{
+            .emit_null_optional_fields = false,
+        }) catch return helpers.serverError();
+    }
+
+    const url = buildInstanceUrl(allocator, tickets_cfg.port, parsed.value.path) orelse return helpers.serverError();
+    defer allocator.free(url);
+
+    var auth_header: ?[]const u8 = null;
+    defer if (auth_header) |value| allocator.free(value);
+    var header_buf: [2]std.http.Header = undefined;
+    var header_count: usize = 0;
+    const lease_scoped = isLeaseScopedNullTicketsAction(http_method, parsed.value.path);
+    const request_bearer_token = if (lease_scoped) parsed.value.bearer_token else null;
+    const forwarded_token: ?[]const u8 = blk: {
+        if (!lease_scoped) break :blk tickets_cfg.api_token;
+        const token = request_bearer_token orelse break :blk null;
+        break :blk if (token.len > 0) token else null;
+    };
+    if (forwarded_token) |token| {
+        auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{token}) catch return helpers.serverError();
+        header_buf[header_count] = .{ .name = "Authorization", .value = auth_header.? };
+        header_count += 1;
+    }
+    if (payload_json != null) {
+        header_buf[header_count] = .{ .name = "Content-Type", .value = "application/json" };
+        header_count += 1;
+    }
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    defer client.deinit();
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = http_method,
+        .payload = if (payload_json) |value| value else null,
+        .response_writer = &response_body.writer,
+        .extra_headers = header_buf[0..header_count],
+    }) catch {
+        return .{
+            .status = "502 Bad Gateway",
+            .content_type = "application/json",
+            .body = "{\"error\":\"NullTickets unreachable\"}",
+        };
+    };
+
+    const response_bytes = response_body.toOwnedSlice() catch return helpers.serverError();
+    const status_code: u10 = @intFromEnum(result.status);
+    return .{
+        .status = actionStatus(status_code),
+        .content_type = "application/json",
+        .body = response_bytes,
+    };
+}
+
 fn getStatusLocked(
     mutex: *std_compat.sync.Mutex,
     manager: *manager_mod.Manager,
@@ -3346,8 +3573,9 @@ fn handleIntegrationGet(
             pipelines = &.{};
         }
 
+        const boiler_runtime = getStatusLocked(mutex, manager, "nullboiler", name);
         var tracker_status = blk: {
-            const status = getStatusLocked(mutex, manager, "nullboiler", name) orelse break :blk null;
+            const status = boiler_runtime orelse break :blk null;
             if (status.status != .running) break :blk null;
             const url = buildInstanceUrl(allocator, boiler_cfg.port, "/tracker/status") orelse break :blk null;
             defer allocator.free(url);
@@ -3367,7 +3595,19 @@ fn handleIntegrationGet(
 
         const body = std.json.Stringify.valueAlloc(allocator, .{
             .kind = "nullboiler",
+            .instance = .{
+                .name = boiler_cfg.name,
+                .port = boiler_cfg.port,
+                .running = if (boiler_runtime) |status| status.status == .running else false,
+                .token_configured = boiler_cfg.api_token != null,
+            },
             .configured = boiler_cfg.tracker != null,
+            .configured_tracker = if (boiler_cfg.tracker) |tracker| .{
+                .url = tracker.url,
+                .agent_id = tracker.agent_id,
+                .token_configured = tracker.api_token != null,
+                .max_concurrent_tasks = tracker.max_concurrent_tasks,
+            } else null,
             .linked_tracker = if (linked) |tracker| .{
                 .name = tracker.name,
                 .port = tracker.port,
@@ -3439,6 +3679,7 @@ fn handleIntegrationGet(
             break :blk fetchJsonValue(allocator, url, tickets_cfg.api_token);
         };
         defer if (queue) |*value| value.deinit(allocator);
+        const tickets_runtime = getStatusLocked(mutex, manager, "nulltickets", name);
 
         var linked_boiler_views: std.ArrayListUnmanaged(LinkedBoilerView) = .empty;
         defer linked_boiler_views.deinit(allocator);
@@ -3452,6 +3693,12 @@ fn handleIntegrationGet(
 
         const body = std.json.Stringify.valueAlloc(allocator, .{
             .kind = "nulltickets",
+            .instance = .{
+                .name = tickets_cfg.name,
+                .port = tickets_cfg.port,
+                .running = if (tickets_runtime) |status| status.status == .running else false,
+                .token_configured = tickets_cfg.api_token != null,
+            },
             .queue = if (queue) |value| value.parsed.value else null,
             .linked_boilers = linked_boiler_views.items,
         }, .{ .emit_null_optional_fields = false }) catch return helpers.serverError();
@@ -3709,6 +3956,11 @@ pub fn isIntegrationPath(target: []const u8) bool {
     return parsed.action != null and std.mem.eql(u8, parsed.action.?, "integration");
 }
 
+pub fn isTicketsActionPath(target: []const u8) bool {
+    const parsed = parsePath(target) orelse return false;
+    return parsed.action != null and std.mem.eql(u8, parsed.action.?, "tickets");
+}
+
 /// Route an `/api/instances` request. Called from server.zig.
 /// `method` is the HTTP verb, `target` is the full request path,
 /// `body` is the (possibly empty) request body.
@@ -3896,6 +4148,10 @@ pub fn dispatch(
             if (std.mem.eql(u8, method, "GET")) return handleIntegrationGet(allocator, s, manager, mutex, paths, parsed.component, parsed.name);
             if (std.mem.eql(u8, method, "POST")) return handleIntegrationPost(allocator, s, manager, mutex, paths, parsed.component, parsed.name, body);
             return methodNotAllowed();
+        }
+        if (std.mem.eql(u8, action, "tickets")) {
+            if (!std.mem.eql(u8, method, "POST")) return methodNotAllowed();
+            return handleNullTicketsAction(allocator, s, manager, mutex, paths, parsed.component, parsed.name, body);
         }
 
         // Remaining actions are POST-only.
@@ -4131,6 +4387,37 @@ test "parseAnyHttpStatusCode extracts first valid http code" {
     try std.testing.expectEqual(@as(?u16, 200), parseAnyHttpStatusCode("{\"x\":1}\n200\n"));
     try std.testing.expectEqual(@as(?u16, 401), parseAnyHttpStatusCode("status=401 unauthorized"));
     try std.testing.expectEqual(@as(?u16, null), parseAnyHttpStatusCode("not-a-code"));
+}
+
+test "isAllowedNullTicketsAction allows only safe tracker actions" {
+    try std.testing.expect(isAllowedNullTicketsAction(.GET, "/pipelines"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/pipelines"));
+    try std.testing.expect(isAllowedNullTicketsAction(.GET, "/tasks?limit=8"));
+    try std.testing.expect(isAllowedNullTicketsAction(.GET, "/tasks/task-a/dependencies"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/tasks/task-a/assignments"));
+    try std.testing.expect(isAllowedNullTicketsAction(.DELETE, "/tasks/task-a/assignments/agent-a"));
+    try std.testing.expect(isAllowedNullTicketsAction(.GET, "/ops/queue"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/tasks"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/leases/claim"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/leases/lease-a/heartbeat"));
+    try std.testing.expect(isAllowedNullTicketsAction(.GET, "/runs/run-a/events?limit=20"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/runs/run-a/events"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/runs/run-a/transition"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/runs/run-a/fail"));
+    try std.testing.expect(isAllowedNullTicketsAction(.GET, "/artifacts?task_id=task-a"));
+    try std.testing.expect(isAllowedNullTicketsAction(.POST, "/artifacts"));
+
+    try std.testing.expect(!isAllowedNullTicketsAction(.POST, "/store/default/key"));
+    try std.testing.expect(!isAllowedNullTicketsAction(.DELETE, "/tasks/task-a"));
+    try std.testing.expect(!isAllowedNullTicketsAction(.GET, "http://127.0.0.1:1/tasks"));
+    try std.testing.expect(!isAllowedNullTicketsAction(.GET, "/tasks\n/evil"));
+    try std.testing.expect(!isAllowedNullTicketsAction(.POST, "/tasks?limit=1"));
+    try std.testing.expect(!isAllowedNullTicketsAction(.POST, "/runs/run-a/events?limit=1"));
+    try std.testing.expect(!isAllowedNullTicketsAction(.POST, "/leases/lease-a/heartbeat?ttl=1"));
+}
+
+test "actionStatus preserves expired lease status" {
+    try std.testing.expectEqualStrings("410 Gone", actionStatus(410));
 }
 
 test "classifyProbeFailure maps status codes" {
@@ -5220,6 +5507,47 @@ test "dispatch routes GET integration action for linked nullboiler" {
     try std.testing.expectEqualStrings("reviewer", current_link.get("claim_role").?.string);
     try std.testing.expectEqualStrings("complete", current_link.get("success_trigger").?.string);
     try std.testing.expectEqual(@as(i64, 2), current_link.get("max_concurrent_tasks").?.integer);
+}
+
+test "dispatch routes nulltickets tickets action to managed instances only" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nulltickets", "tracker-a", .{ .version = "1.0.0" });
+    try writeTestInstanceConfig(allocator, mctx.paths, "nulltickets", "tracker-a", "{\"port\":7711,\"api_token\":\"admin-token\"}");
+
+    const resp = dispatch(
+        allocator,
+        &s,
+        &mctx.manager,
+        &mctx.mutex,
+        mctx.paths,
+        "POST",
+        "/api/instances/nulltickets/tracker-a/tickets",
+        "{\"method\":\"GET\",\"path\":\"/tasks?limit=8\"}",
+    ).?;
+
+    try std.testing.expectEqualStrings("409 Conflict", resp.status);
+    try std.testing.expectEqualStrings("{\"error\":\"nulltickets instance is not running\"}", resp.body);
+
+    const unsupported = dispatch(
+        allocator,
+        &s,
+        &mctx.manager,
+        &mctx.mutex,
+        mctx.paths,
+        "POST",
+        "/api/instances/nulltickets/tracker-a/tickets",
+        "{\"method\":\"POST\",\"path\":\"/store/default/key\"}",
+    ).?;
+    try std.testing.expectEqualStrings("400 Bad Request", unsupported.status);
 }
 
 test "dispatch routes POST integration action for nullboiler" {

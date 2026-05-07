@@ -1,6 +1,8 @@
 import {
   BOILER_INSTANCE_QUERY_PARAM,
+  TICKETS_INSTANCE_QUERY_PARAM,
   getSelectedBoilerInstance,
+  getSelectedTicketsInstance,
 } from "./backendSelection";
 
 export function encodePathSegment(value: string): string {
@@ -9,6 +11,7 @@ export function encodePathSegment(value: string): string {
 
 type OrchestrationRouteOptions = {
   boilerInstance?: string;
+  ticketsInstance?: string;
 };
 
 function setQueryParam(path: string, key: string, value: string): string {
@@ -37,6 +40,11 @@ export function withBoilerInstance(path: string, boilerInstance?: string): strin
   return setQueryParam(path, BOILER_INSTANCE_QUERY_PARAM, value);
 }
 
+export function withTicketsInstance(path: string, ticketsInstance?: string): string {
+  const value = ticketsInstance ?? getSelectedTicketsInstance();
+  return setQueryParam(path, TICKETS_INSTANCE_QUERY_PARAM, value);
+}
+
 const uiRoot = '/orchestration';
 const apiRoot = '/orchestration';
 const workflowsBase = `${uiRoot}/workflows`;
@@ -51,7 +59,7 @@ export const orchestrationUiRoutes = {
   runs: (options?: OrchestrationRouteOptions) => withBoilerInstance(runsBase, options?.boilerInstance),
   run: (id: string, options?: OrchestrationRouteOptions) => withBoilerInstance(`${runsBase}/${encodePathSegment(id)}`, options?.boilerInstance),
   runFork: (id: string, options?: OrchestrationRouteOptions) => withBoilerInstance(`${runsBase}/${encodePathSegment(id)}/fork`, options?.boilerInstance),
-  store: () => `${uiRoot}/store`,
+  store: (options?: OrchestrationRouteOptions) => withTicketsInstance(`${uiRoot}/store`, options?.ticketsInstance),
 };
 
 export const orchestrationApiPaths = {
@@ -62,6 +70,7 @@ export const orchestrationApiPaths = {
   runs: () => `${apiRoot}/runs`,
   run: (id: string) => `${apiRoot}/runs/${encodePathSegment(id)}`,
   runCancel: (id: string) => `${apiRoot}/runs/${encodePathSegment(id)}/cancel`,
+  runRetry: (id: string) => `${apiRoot}/runs/${encodePathSegment(id)}/retry`,
   runResume: (id: string) => `${apiRoot}/runs/${encodePathSegment(id)}/resume`,
   runReplay: (id: string) => `${apiRoot}/runs/${encodePathSegment(id)}/replay`,
   runState: (id: string) => `${apiRoot}/runs/${encodePathSegment(id)}/state`,
@@ -69,6 +78,12 @@ export const orchestrationApiPaths = {
   runCheckpoints: (runId: string) => `${apiRoot}/runs/${encodePathSegment(runId)}/checkpoints`,
   runCheckpoint: (runId: string, checkpointId: string) => `${apiRoot}/runs/${encodePathSegment(runId)}/checkpoints/${encodePathSegment(checkpointId)}`,
   runStream: (runId: string) => `${apiRoot}/runs/${encodePathSegment(runId)}/stream`,
+  trackerStatus: () => `${apiRoot}/tracker/status`,
+  trackerTasks: () => `${apiRoot}/tracker/tasks`,
+  trackerStats: () => `${apiRoot}/tracker/stats`,
+  trackerRefresh: () => `${apiRoot}/tracker/refresh`,
+  workers: () => `${apiRoot}/workers`,
+  worker: (id: string) => `${apiRoot}/workers/${encodePathSegment(id)}`,
   storeNamespace: (namespace: string) => `${storeBase}/${encodePathSegment(namespace)}`,
   storeEntry: (namespace: string, key: string) => `${storeBase}/${encodePathSegment(namespace)}/${encodePathSegment(key)}`,
 };

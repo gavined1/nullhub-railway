@@ -1,7 +1,9 @@
 const SELECTED_BOILER_STORAGE_KEY = "nullhub.orchestration.boiler_instance";
 const SELECTED_TICKETS_STORAGE_KEY = "nullhub.orchestration.tickets_instance";
 export const BOILER_INSTANCE_QUERY_PARAM = "boiler_instance";
+export const TICKETS_INSTANCE_QUERY_PARAM = "tickets_instance";
 export const BOILER_INSTANCE_CHANGE_EVENT = "nullhub:boiler-instance-change";
+export const TICKETS_INSTANCE_CHANGE_EVENT = "nullhub:tickets-instance-change";
 
 function storage(): Storage | null {
   try {
@@ -34,10 +36,18 @@ function currentHistory(): History | null {
 }
 
 function getUrlBoilerInstance(): string {
+  return getUrlQueryParam(BOILER_INSTANCE_QUERY_PARAM);
+}
+
+function getUrlTicketsInstance(): string {
+  return getUrlQueryParam(TICKETS_INSTANCE_QUERY_PARAM);
+}
+
+function getUrlQueryParam(param: string): string {
   const location = currentLocation();
   if (!location) return "";
   try {
-    return new URLSearchParams(location.search).get(BOILER_INSTANCE_QUERY_PARAM) || "";
+    return new URLSearchParams(location.search).get(param) || "";
   } catch {
     return "";
   }
@@ -54,14 +64,25 @@ function syncCurrentBoilerUrl(value: string) {
   history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
-function dispatchBoilerInstanceChange(value: string) {
+function syncCurrentTicketsUrl(value: string) {
+  const location = currentLocation();
+  const history = currentHistory();
+  if (!location || !history || !location.pathname.startsWith("/orchestration/store")) return;
+
+  const url = new URL(location.href);
+  if (value) url.searchParams.set(TICKETS_INSTANCE_QUERY_PARAM, value);
+  else url.searchParams.delete(TICKETS_INSTANCE_QUERY_PARAM);
+  history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function dispatchSelectionChange(eventName: string, value: string) {
   try {
     if (
       typeof globalThis !== "undefined" &&
       "dispatchEvent" in globalThis &&
       "CustomEvent" in globalThis
     ) {
-      globalThis.dispatchEvent(new CustomEvent(BOILER_INSTANCE_CHANGE_EVENT, { detail: { value } }));
+      globalThis.dispatchEvent(new CustomEvent(eventName, { detail: { value } }));
     }
   } catch {
     /* ignore */
@@ -79,16 +100,19 @@ export function setSelectedBoilerInstance(value: string) {
     else store.removeItem(SELECTED_BOILER_STORAGE_KEY);
   }
   syncCurrentBoilerUrl(value);
-  dispatchBoilerInstanceChange(value);
+  dispatchSelectionChange(BOILER_INSTANCE_CHANGE_EVENT, value);
 }
 
 export function getSelectedTicketsInstance(): string {
-  return storage()?.getItem(SELECTED_TICKETS_STORAGE_KEY) || "";
+  return getUrlTicketsInstance() || storage()?.getItem(SELECTED_TICKETS_STORAGE_KEY) || "";
 }
 
 export function setSelectedTicketsInstance(value: string) {
   const store = storage();
-  if (!store) return;
-  if (value) store.setItem(SELECTED_TICKETS_STORAGE_KEY, value);
-  else store.removeItem(SELECTED_TICKETS_STORAGE_KEY);
+  if (store) {
+    if (value) store.setItem(SELECTED_TICKETS_STORAGE_KEY, value);
+    else store.removeItem(SELECTED_TICKETS_STORAGE_KEY);
+  }
+  syncCurrentTicketsUrl(value);
+  dispatchSelectionChange(TICKETS_INSTANCE_CHANGE_EVENT, value);
 }

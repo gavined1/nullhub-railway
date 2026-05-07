@@ -3,7 +3,10 @@
   import { onMount } from "svelte";
   import { api } from "$lib/api/client";
   import { orchestrationUiRoutes, routePath } from "$lib/orchestration/routes";
-  import { BOILER_INSTANCE_CHANGE_EVENT } from "$lib/orchestration/backendSelection";
+  import {
+    BOILER_INSTANCE_CHANGE_EVENT,
+    TICKETS_INSTANCE_CHANGE_EVENT,
+  } from "$lib/orchestration/backendSelection";
 
   let instances = $state<Record<string, any>>({});
   let installedComponents = $state<Record<string, any>>({});
@@ -12,6 +15,7 @@
   let showTicketsStore = $derived(Boolean(installedComponents["nulltickets"]?.installed));
   let showStore = $derived(showBoilerOrchestration || showTicketsStore);
   let boilerSelectionVersion = $state(0);
+  let ticketsSelectionVersion = $state(0);
   let orchestrationDashboardHref = $derived.by(() => {
     boilerSelectionVersion;
     return orchestrationUiRoutes.dashboard();
@@ -23,6 +27,10 @@
   let orchestrationRunsHref = $derived.by(() => {
     boilerSelectionVersion;
     return orchestrationUiRoutes.runs();
+  });
+  let orchestrationStoreHref = $derived.by(() => {
+    ticketsSelectionVersion;
+    return orchestrationUiRoutes.store();
   });
 
   async function loadSidebarState() {
@@ -48,10 +56,15 @@
     const refreshBoilerLinks = () => {
       boilerSelectionVersion += 1;
     };
+    const refreshTicketsLinks = () => {
+      ticketsSelectionVersion += 1;
+    };
     globalThis.addEventListener?.(BOILER_INSTANCE_CHANGE_EVENT, refreshBoilerLinks);
+    globalThis.addEventListener?.(TICKETS_INSTANCE_CHANGE_EVENT, refreshTicketsLinks);
     return () => {
       clearInterval(interval);
       globalThis.removeEventListener?.(BOILER_INSTANCE_CHANGE_EVENT, refreshBoilerLinks);
+      globalThis.removeEventListener?.(TICKETS_INSTANCE_CHANGE_EVENT, refreshTicketsLinks);
     };
   });
 </script>
@@ -97,7 +110,7 @@
         <a href={orchestrationRunsHref} class:active={currentPath.startsWith(routePath(orchestrationRunsHref))}>Runs</a>
       {/if}
       {#if showStore}
-        <a href={orchestrationUiRoutes.store()} class:active={currentPath.startsWith(orchestrationUiRoutes.store())}>Store</a>
+        <a href={orchestrationStoreHref} class:active={currentPath.startsWith(routePath(orchestrationStoreHref))}>Store</a>
       {/if}
     </div>
   {/if}

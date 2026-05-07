@@ -636,7 +636,10 @@ pub const Server = struct {
     }
 
     fn routeWithoutServerMutex(target: []const u8) bool {
-        return instances_api.isIntegrationPath(target) or orchestration_api.isProxyPath(target);
+        return instances_api.isIntegrationPath(target) or
+            instances_api.isTicketsActionPath(target) or
+            logs_api.isLogsPath(target) or
+            orchestration_api.isProxyPath(target);
     }
 
     fn route(self: *Server, allocator: std.mem.Allocator, method: []const u8, target: []const u8, body: []const u8) Response {
@@ -1966,6 +1969,7 @@ test "routeWithoutServerMutex keeps orchestration proxy requests off global lock
     try std.testing.expect(Server.routeWithoutServerMutex("/api/orchestration/runs"));
     try std.testing.expect(Server.routeWithoutServerMutex("/api/orchestration/store/search"));
     try std.testing.expect(Server.routeWithoutServerMutex("/api/instances/nullclaw/demo/logs"));
+    try std.testing.expect(Server.routeWithoutServerMutex("/api/instances/nulltickets/tracker-a/tickets"));
     try std.testing.expect(!Server.routeWithoutServerMutex("/api/components"));
 }
 
