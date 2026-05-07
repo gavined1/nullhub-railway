@@ -139,14 +139,20 @@ fn ensureUiBuildExists() void {
 }
 
 fn runCommandOrPanic(allocator: std.mem.Allocator, argv: []const []const u8) void {
-    _ = allocator;
-    const run_allocator = std.heap.page_allocator;
-    const result = std_compat.process.Child.run(.{
-        .allocator = run_allocator,
+    const c_environ = std.c.environ;
+    var env_count: usize = 0;
+    while (c_environ[env_count] != null) : (env_count += 1) {}
+    const env_block: std.process.Environ.Block = .{ .slice = c_environ[0..env_count :null] };
+
+    var threaded: std.Io.Threaded = .init(allocator, .{ .environ = .{ .block = env_block } });
+    defer threaded.deinit();
+    const run_io = threaded.io();
+
+    const result = std.process.run(allocator, run_io, .{
         .argv = argv,
     }) catch |err| std.debug.panic("failed to run {s}: {s}", .{ argv[0], @errorName(err) });
-    defer run_allocator.free(result.stdout);
-    defer run_allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
     switch (result.term) {
         .exited => |code| {
