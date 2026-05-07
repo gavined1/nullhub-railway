@@ -176,35 +176,42 @@ pub fn loadNullBoilerConfig(allocator: std.mem.Allocator, paths: paths_mod.Paths
     var cfg = NullBoilerConfig{
         .name = try allocator.dupe(u8, name),
         .port = parsed.value.port,
-        .api_token = if (parsed.value.api_token) |token| try allocator.dupe(u8, token) else null,
     };
     errdefer deinitNullBoilerConfig(allocator, &cfg);
+    if (parsed.value.api_token) |token| {
+        cfg.api_token = try allocator.dupe(u8, token);
+    }
 
     if (parsed.value.tracker) |tracker| {
-        var tracker_cfg = NullBoilerTrackerConfig{
-            .url = try allocator.dupe(u8, tracker.url orelse ""),
-            .api_token = if (tracker.api_token) |token| try allocator.dupe(u8, token) else null,
-            .agent_id = try allocator.dupe(u8, tracker.agent_id),
-            .workflows_dir = try resolveRelativePath(allocator, config_dir, tracker.workflows_dir),
-            .max_concurrent_tasks = tracker.concurrency.max_concurrent_tasks,
-        };
-        errdefer {
-            allocator.free(tracker_cfg.url);
-            if (tracker_cfg.api_token) |token| allocator.free(token);
-            allocator.free(tracker_cfg.agent_id);
-            allocator.free(tracker_cfg.workflows_dir);
-            if (tracker_cfg.workflow) |*workflow| {
-                allocator.free(workflow.file_name);
-                allocator.free(workflow.pipeline_id);
-                allocator.free(workflow.claim_role);
-                allocator.free(workflow.success_trigger);
-            }
-        }
-        tracker_cfg.workflow = try loadPrimaryWorkflowConfig(allocator, tracker_cfg.workflows_dir);
-        cfg.tracker = tracker_cfg;
+        cfg.tracker = try loadNullBoilerTrackerConfig(allocator, config_dir, tracker);
     }
 
     return cfg;
+}
+
+fn loadNullBoilerTrackerConfig(
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+    tracker: NullBoilerTrackerConfigFile,
+) !NullBoilerTrackerConfig {
+    const tracker_url = try allocator.dupe(u8, tracker.url orelse "");
+    errdefer allocator.free(tracker_url);
+    const tracker_api_token = if (tracker.api_token) |token| try allocator.dupe(u8, token) else null;
+    errdefer if (tracker_api_token) |token| allocator.free(token);
+    const tracker_agent_id = try allocator.dupe(u8, tracker.agent_id);
+    errdefer allocator.free(tracker_agent_id);
+    const tracker_workflows_dir = try resolveRelativePath(allocator, config_dir, tracker.workflows_dir);
+    errdefer allocator.free(tracker_workflows_dir);
+    const tracker_workflow = try loadPrimaryWorkflowConfig(allocator, tracker_workflows_dir);
+
+    return .{
+        .url = tracker_url,
+        .api_token = tracker_api_token,
+        .agent_id = tracker_agent_id,
+        .workflows_dir = tracker_workflows_dir,
+        .max_concurrent_tasks = tracker.concurrency.max_concurrent_tasks,
+        .workflow = tracker_workflow,
+    };
 }
 
 pub fn deinitNullTicketsConfig(allocator: std.mem.Allocator, cfg: *NullTicketsConfig) void {
@@ -547,18 +554,20 @@ const NullWatchConfigFile = struct {
     api_token: ?[]const u8 = null,
 };
 
+const NullBoilerTrackerConfigFile = struct {
+    url: ?[]const u8 = null,
+    api_token: ?[]const u8 = null,
+    agent_id: []const u8 = "nullboiler",
+    concurrency: struct {
+        max_concurrent_tasks: u32 = 10,
+    } = .{},
+    workflows_dir: []const u8 = "workflows",
+};
+
 const NullBoilerConfigFile = struct {
     port: u16 = 8080,
     api_token: ?[]const u8 = null,
-    tracker: ?struct {
-        url: ?[]const u8 = null,
-        api_token: ?[]const u8 = null,
-        agent_id: []const u8 = "nullboiler",
-        concurrency: struct {
-            max_concurrent_tasks: u32 = 10,
-        } = .{},
-        workflows_dir: []const u8 = "workflows",
-    } = null,
+    tracker: ?NullBoilerTrackerConfigFile = null,
 };
 
 const WorkflowFile = struct {

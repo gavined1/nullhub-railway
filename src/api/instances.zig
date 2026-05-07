@@ -712,7 +712,12 @@ fn fetchPipelineSummaries(allocator: std.mem.Allocator, url: []const u8, bearer_
     const pipeline_items = pipelineItemsFromValue(parsed.value) orelse return null;
 
     var list: std.ArrayListUnmanaged(PipelineSummary) = .empty;
-    errdefer deinitPipelineSummaries(allocator, list.items);
+    var summaries_owned = false;
+    defer {
+        if (!summaries_owned) {
+            for (list.items) |summary| deinitPipelineSummary(allocator, summary);
+        }
+    }
     defer list.deinit(allocator);
 
     for (pipeline_items) |item| {
@@ -723,7 +728,9 @@ fn fetchPipelineSummaries(allocator: std.mem.Allocator, url: []const u8, bearer_
         };
     }
 
-    return list.toOwnedSlice(allocator) catch null;
+    const summaries = list.toOwnedSlice(allocator) catch return null;
+    summaries_owned = true;
+    return summaries;
 }
 
 fn pipelineItemsFromValue(value: std.json.Value) ?[]const std.json.Value {
@@ -4150,7 +4157,10 @@ fn parseOptionalPositiveU32(value: ?std.json.Value) ?u32 {
     const raw = value orelse return null;
     return switch (raw) {
         .integer => if (raw.integer > 0 and raw.integer <= std.math.maxInt(u32)) @as(?u32, @intCast(raw.integer)) else null,
-        .string => std.fmt.parseInt(u32, raw.string, 10) catch null,
+        .string => |text| blk: {
+            const parsed = std.fmt.parseInt(u32, text, 10) catch break :blk null;
+            break :blk if (parsed > 0) parsed else null;
+        },
         else => null,
     };
 }
@@ -4676,6 +4686,14 @@ test "pipeline summaries accept wrapped lists and JSON string definitions" {
     try std.testing.expect(pipelineContainsString(summary.roles, "coder"));
     try std.testing.expect(pipelineContainsString(summary.triggers, "complete"));
     try std.testing.expect(pipelineContainsString(summary.triggers, "needs_review"));
+}
+
+test "parseOptionalPositiveU32 rejects zero values" {
+    try std.testing.expect(parseOptionalPositiveU32(std.json.Value{ .integer = 0 }) == null);
+    try std.testing.expect(parseOptionalPositiveU32(std.json.Value{ .string = "0" }) == null);
+    try std.testing.expect(parseOptionalPositiveU32(std.json.Value{ .string = "" }) == null);
+    try std.testing.expectEqual(@as(?u32, 4), parseOptionalPositiveU32(std.json.Value{ .integer = 4 }));
+    try std.testing.expectEqual(@as(?u32, 5), parseOptionalPositiveU32(std.json.Value{ .string = "5" }));
 }
 
 fn writeTestInstanceConfig(

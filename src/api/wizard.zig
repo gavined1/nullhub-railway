@@ -530,8 +530,7 @@ fn prepareWizardBody(
     if (tracker_instance == null) {
         if (parsed.value.object.get("tracker_instance") == null) return null;
         parsed.value.object.put(allocator, "tracker_enabled", .{ .string = "false" }) catch return null;
-        _ = parsed.value.object.swapRemove("tracker_url");
-        _ = parsed.value.object.swapRemove("tracker_api_token");
+        removeNullBoilerTrackerAnswerFields(&parsed.value.object);
         return std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch return null;
     }
 
@@ -548,17 +547,32 @@ fn prepareWizardBody(
     } else {
         _ = root.swapRemove("tracker_api_token");
     }
-    if (!root.contains("tracker_claim_role")) {
-        root.put(allocator, "tracker_claim_role", .{ .string = "coder" }) catch return null;
-    }
-    if (!root.contains("tracker_success_trigger")) {
-        root.put(allocator, "tracker_success_trigger", .{ .string = "complete" }) catch return null;
-    }
-    if (!root.contains("tracker_max_concurrent_tasks")) {
-        root.put(allocator, "tracker_max_concurrent_tasks", .{ .string = "1" }) catch return null;
-    }
+    putDefaultStringIfMissingOrEmpty(allocator, root, "tracker_claim_role", "coder") catch return null;
+    putDefaultStringIfMissingOrEmpty(allocator, root, "tracker_success_trigger", "complete") catch return null;
+    putDefaultStringIfMissingOrEmpty(allocator, root, "tracker_max_concurrent_tasks", "1") catch return null;
 
     return std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch return null;
+}
+
+fn removeNullBoilerTrackerAnswerFields(root: *std.json.ObjectMap) void {
+    _ = root.swapRemove("tracker_url");
+    _ = root.swapRemove("tracker_api_token");
+    _ = root.swapRemove("tracker_pipeline_id");
+    _ = root.swapRemove("tracker_claim_role");
+    _ = root.swapRemove("tracker_success_trigger");
+    _ = root.swapRemove("tracker_max_concurrent_tasks");
+}
+
+fn putDefaultStringIfMissingOrEmpty(
+    allocator: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (root.get(key)) |existing| {
+        if (existing != .string or existing.string.len > 0) return;
+    }
+    try root.put(allocator, key, .{ .string = value });
 }
 
 fn validateWizardBodyForInstall(
@@ -1600,7 +1614,7 @@ test "prepareWizardBody disables stale nullboiler tracker flag when no local tra
     const rendered = prepareWizardBody(
         allocator,
         "nullboiler",
-        "{\"instance_name\":\"worker-a\",\"tracker_instance\":\"\",\"tracker_enabled\":\"true\",\"tracker_url\":\"http://127.0.0.1:7700\",\"tracker_api_token\":\"old\"}",
+        "{\"instance_name\":\"worker-a\",\"tracker_instance\":\"\",\"tracker_enabled\":\"true\",\"tracker_url\":\"http://127.0.0.1:7700\",\"tracker_api_token\":\"old\",\"tracker_pipeline_id\":\"pipe-dev\",\"tracker_claim_role\":\"coder\",\"tracker_success_trigger\":\"complete\",\"tracker_max_concurrent_tasks\":\"4\"}",
         fixture.paths,
     ) orelse @panic("prepareWizardBody");
     defer allocator.free(rendered);
@@ -1615,6 +1629,48 @@ test "prepareWizardBody disables stale nullboiler tracker flag when no local tra
     try std.testing.expectEqualStrings("false", obj.get("tracker_enabled").?.string);
     try std.testing.expect(obj.get("tracker_url") == null);
     try std.testing.expect(obj.get("tracker_api_token") == null);
+    try std.testing.expect(obj.get("tracker_pipeline_id") == null);
+    try std.testing.expect(obj.get("tracker_claim_role") == null);
+    try std.testing.expect(obj.get("tracker_success_trigger") == null);
+    try std.testing.expect(obj.get("tracker_max_concurrent_tasks") == null);
+}
+
+test "prepareWizardBody defaults empty nullboiler tracker settings" {
+    const allocator = std.testing.allocator;
+    var fixture = try test_helpers.TempPaths.init(allocator);
+    defer fixture.deinit();
+    fixture.paths.ensureDirs() catch @panic("ensureDirs");
+
+    const inst_dir = fixture.paths.instanceDir(allocator, "nulltickets", "tracker-a") catch @panic("instanceDir");
+    defer allocator.free(inst_dir);
+    std.fs.makePathAbsolute(inst_dir) catch @panic("makePathAbsolute");
+
+    const config_path = fixture.paths.instanceConfig(allocator, "nulltickets", "tracker-a") catch @panic("instanceConfig");
+    defer allocator.free(config_path);
+    {
+        const file = std_compat.fs.createFileAbsolute(config_path, .{ .truncate = true }) catch @panic("createFileAbsolute");
+        defer file.close();
+        file.writeAll("{\"port\":7711}\n") catch @panic("writeAll");
+    }
+
+    const rendered = prepareWizardBody(
+        allocator,
+        "nullboiler",
+        "{\"instance_name\":\"worker-a\",\"tracker_instance\":\"tracker-a\",\"tracker_claim_role\":\"\",\"tracker_success_trigger\":\"\",\"tracker_max_concurrent_tasks\":\"\"}",
+        fixture.paths,
+    ) orelse @panic("prepareWizardBody");
+    defer allocator.free(rendered);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, rendered, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch @panic("parseFromSlice");
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("coder", obj.get("tracker_claim_role").?.string);
+    try std.testing.expectEqualStrings("complete", obj.get("tracker_success_trigger").?.string);
+    try std.testing.expectEqualStrings("1", obj.get("tracker_max_concurrent_tasks").?.string);
 }
 
 test "prepareWizardBody removes stale token when selected nulltickets has no token" {
