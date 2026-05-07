@@ -17,6 +17,8 @@ const query_api = @import("query.zig");
 const test_helpers = @import("../test_helpers.zig");
 const instance_runtime = @import("instance_runtime.zig");
 const registry = @import("../installer/registry.zig");
+const downloader = @import("../installer/downloader.zig");
+const platform = @import("../core/platform.zig");
 
 const ApiResponse = helpers.ApiResponse;
 const appendEscaped = helpers.appendEscaped;
@@ -38,6 +40,129 @@ fn defaultLaunchModeForComponent(component: []const u8) []const u8 {
 fn isLegacyDefaultLaunchMode(component: []const u8, launch_mode: []const u8) bool {
     const default_launch = defaultLaunchModeForComponent(component);
     return !std.mem.eql(u8, default_launch, "gateway") and std.mem.eql(u8, launch_mode, "gateway");
+}
+
+const StartBinary = struct {
+    path: []const u8,
+    version: []const u8,
+    version_owned: bool = false,
+
+    fn deinit(self: StartBinary, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.version_owned) allocator.free(self.version);
+    }
+};
+
+fn persistStartVersion(
+    s: *state_mod.State,
+    component: []const u8,
+    name: []const u8,
+    entry: state_mod.InstanceEntry,
+    version: []const u8,
+) !void {
+    const updated = try s.updateInstance(component, name, .{
+        .version = version,
+        .auto_start = entry.auto_start,
+        .launch_mode = entry.launch_mode,
+        .verbose = entry.verbose,
+    });
+    if (!updated) return error.StateError;
+    s.save() catch return error.StateError;
+}
+
+fn resolveStandaloneStartBinary(
+    allocator: std.mem.Allocator,
+    s: *state_mod.State,
+    paths: paths_mod.Paths,
+    component: []const u8,
+    name: []const u8,
+    entry: state_mod.InstanceEntry,
+) !StartBinary {
+    if (local_binary.stageDevLocal(allocator, paths, component)) |dest_bin| {
+        persistStartVersion(s, component, name, entry, local_binary.dev_local_version) catch |err| {
+            allocator.free(dest_bin);
+            return err;
+        };
+        return .{ .path = dest_bin, .version = local_binary.dev_local_version };
+    }
+
+    const known = registry.findKnownComponent(component) orelse return error.NoPlatformAsset;
+    var release = registry.fetchLatestRelease(allocator, known.repo) catch return error.FetchFailed;
+    defer release.deinit();
+
+    const platform_key = comptime platform.detect().toString();
+    const asset = registry.findAssetForComponentPlatform(allocator, release.value, component, platform_key) orelse return error.NoPlatformAsset;
+
+    const version = try allocator.dupe(u8, release.value.tag_name);
+    errdefer allocator.free(version);
+    const bin_path = try paths.binary(allocator, component, version);
+    errdefer allocator.free(bin_path);
+
+    downloader.downloadIfMissing(allocator, asset.browser_download_url, bin_path) catch return error.DownloadFailed;
+    persistStartVersion(s, component, name, entry, version) catch |err| return err;
+
+    return .{ .path = bin_path, .version = version, .version_owned = true };
+}
+
+fn resolveStartBinary(
+    allocator: std.mem.Allocator,
+    s: *state_mod.State,
+    paths: paths_mod.Paths,
+    component: []const u8,
+    name: []const u8,
+    entry: state_mod.InstanceEntry,
+) !StartBinary {
+    if (std.mem.eql(u8, entry.version, "standalone")) {
+        return resolveStandaloneStartBinary(allocator, s, paths, component, name, entry);
+    }
+
+    local_binary.refreshStagedDevLocal(allocator, paths, component, entry.version);
+    return .{
+        .path = try paths.binary(allocator, component, entry.version),
+        .version = entry.version,
+    };
+}
+
+fn startBinaryError(err: anyerror) ApiResponse {
+    return switch (err) {
+        error.FetchFailed => .{
+            .status = "502 Bad Gateway",
+            .content_type = "application/json",
+            .body = "{\"error\":\"failed to fetch latest release\"}",
+        },
+        error.NoPlatformAsset => .{
+            .status = "502 Bad Gateway",
+            .content_type = "application/json",
+            .body = "{\"error\":\"no platform asset for latest version\"}",
+        },
+        error.DownloadFailed => .{
+            .status = "502 Bad Gateway",
+            .content_type = "application/json",
+            .body = "{\"error\":\"failed to download latest binary\"}",
+        },
+        else => helpers.serverError(),
+    };
+}
+
+fn isExternalStandaloneRunning(
+    allocator: std.mem.Allocator,
+    paths: paths_mod.Paths,
+    manager: *manager_mod.Manager,
+    component: []const u8,
+    name: []const u8,
+    entry: state_mod.InstanceEntry,
+) bool {
+    if (manager.getStatus(component, name) != null) return false;
+    const snapshot = instance_runtime.resolve(allocator, paths, manager, component, name, entry);
+    return snapshot.status == .running;
+}
+
+fn externalStandaloneConflict() ApiResponse {
+    return .{
+        .status = "409 Conflict",
+        .content_type = "application/json",
+        .body = "{\"error\":\"instance is running outside nullhub supervision\"}",
+    };
 }
 
 const FetchedJsonValue = struct {
@@ -1859,6 +1984,9 @@ pub fn handleGet(allocator: std.mem.Allocator, s: *state_mod.State, manager: *ma
 /// POST /api/instances/{component}/{name}/start
 pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *manager_mod.Manager, paths: paths_mod.Paths, component: []const u8, name: []const u8, body: []const u8) ApiResponse {
     const entry = s.getInstance(component, name) orelse return notFound();
+    if (isExternalStandaloneRunning(allocator, paths, manager, component, name, entry)) {
+        return externalStandaloneConflict();
+    }
 
     _ = nullclaw_web_channel.ensureNullclawWebChannelConfig(
         allocator,
@@ -1902,11 +2030,10 @@ pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *
         }
     }
 
-    local_binary.refreshStagedDevLocal(allocator, paths, component, entry.version);
-
-    // Resolve binary path
-    const bin_path = paths.binary(allocator, component, entry.version) catch return helpers.serverError();
-    defer allocator.free(bin_path);
+    const start_binary = resolveStartBinary(allocator, s, paths, component, name, entry) catch |err| return startBinaryError(err);
+    defer start_binary.deinit(allocator);
+    const bin_path = start_binary.path;
+    const current_version = start_binary.version;
 
     // Read manifest from binary to get health endpoint and port
     var health_endpoint: []const u8 = "/health";
@@ -1943,7 +2070,7 @@ pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *
             if (should_normalize_launch) {
                 launch_cmd = mode;
                 _ = s.updateInstance(component, name, .{
-                    .version = entry.version,
+                    .version = current_version,
                     .auto_start = entry.auto_start,
                     .launch_mode = launch_cmd,
                     .verbose = entry.verbose,
@@ -1975,15 +2102,21 @@ pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *
 }
 
 /// POST /api/instances/{component}/{name}/stop
-pub fn handleStop(s: *state_mod.State, manager: *manager_mod.Manager, component: []const u8, name: []const u8) ApiResponse {
-    _ = s.getInstance(component, name) orelse return notFound();
+pub fn handleStop(allocator: std.mem.Allocator, s: *state_mod.State, manager: *manager_mod.Manager, paths: paths_mod.Paths, component: []const u8, name: []const u8) ApiResponse {
+    const entry = s.getInstance(component, name) orelse return notFound();
+    if (isExternalStandaloneRunning(allocator, paths, manager, component, name, entry)) {
+        return externalStandaloneConflict();
+    }
     manager.stopInstance(component, name) catch return helpers.serverError();
     return jsonOk("{\"status\":\"stopped\"}");
 }
 
 /// POST /api/instances/{component}/{name}/restart
 pub fn handleRestart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *manager_mod.Manager, paths: paths_mod.Paths, component: []const u8, name: []const u8, body: []const u8) ApiResponse {
-    _ = s.getInstance(component, name) orelse return notFound();
+    const entry = s.getInstance(component, name) orelse return notFound();
+    if (isExternalStandaloneRunning(allocator, paths, manager, component, name, entry)) {
+        return externalStandaloneConflict();
+    }
     manager.stopInstance(component, name) catch {};
     return handleStart(allocator, s, manager, paths, component, name, body);
 }
@@ -3824,7 +3957,7 @@ pub fn dispatch(
         if (!std.mem.eql(u8, method, "POST")) return methodNotAllowed();
 
         if (std.mem.eql(u8, action, "start")) return handleStart(allocator, s, manager, paths, parsed.component, parsed.name, body);
-        if (std.mem.eql(u8, action, "stop")) return handleStop(s, manager, parsed.component, parsed.name);
+        if (std.mem.eql(u8, action, "stop")) return handleStop(allocator, s, manager, paths, parsed.component, parsed.name);
         if (std.mem.eql(u8, action, "restart")) return handleRestart(allocator, s, manager, paths, parsed.component, parsed.name, body);
 
         return notFound();
@@ -4441,7 +4574,7 @@ test "handleStop returns 200 for existing instance" {
 
     try s.addInstance("nullclaw", "my-agent", .{ .version = "1.0.0" });
 
-    const resp = handleStop(&s, &mctx.manager, "nullclaw", "my-agent");
+    const resp = handleStop(allocator, &s, &mctx.manager, mctx.paths, "nullclaw", "my-agent");
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expectEqualStrings("{\"status\":\"stopped\"}", resp.body);
 }

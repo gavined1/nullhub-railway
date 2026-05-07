@@ -1,5 +1,6 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 const registry = @import("../installer/registry.zig");
 const paths_mod = @import("../core/paths.zig");
 const state_mod = @import("../core/state.zig");
@@ -21,7 +22,12 @@ pub fn deriveDisplayName(allocator: std.mem.Allocator, name: []const u8) ![]cons
 
 /// Check if a component has a standalone installation at ~/.{component}/config.json
 fn hasStandaloneInstall(allocator: std.mem.Allocator, component: []const u8) bool {
-    const home = std_compat.process.getEnvVarOwned(allocator, "HOME") catch return false;
+    const home = std_compat.process.getEnvVarOwned(allocator, "HOME") catch blk: {
+        if (builtin.os.tag == .windows) {
+            break :blk std_compat.process.getEnvVarOwned(allocator, "USERPROFILE") catch return false;
+        }
+        return false;
+    };
     defer allocator.free(home);
     const dot_name = std.fmt.allocPrint(allocator, ".{s}", .{component}) catch return false;
     defer allocator.free(dot_name);

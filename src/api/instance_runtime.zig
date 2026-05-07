@@ -50,10 +50,55 @@ pub fn readPortFromConfig(allocator: std.mem.Allocator, paths: paths_mod.Paths, 
         }
     }
 
-    return switch (current) {
-        .integer => |value| if (value >= 0 and value <= 65535) @intCast(value) else null,
+    return parsePortValue(current);
+}
+
+fn parsePortValue(value: std.json.Value) ?u16 {
+    return switch (value) {
+        .integer => |raw| if (raw >= 0 and raw <= 65535) @intCast(raw) else null,
+        .number_string => |raw| std.fmt.parseInt(u16, raw, 10) catch null,
+        .string => |raw| std.fmt.parseInt(u16, raw, 10) catch null,
         else => null,
     };
+}
+
+fn readStringFromConfig(allocator: std.mem.Allocator, paths: paths_mod.Paths, component: []const u8, name: []const u8, dot_key: []const u8) ?[]u8 {
+    const config_path = paths.instanceConfig(allocator, component, name) catch return null;
+    defer allocator.free(config_path);
+
+    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch return null;
+    defer file.close();
+    const contents = file.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return null;
+    defer allocator.free(contents);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, contents, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+
+    var current = parsed.value;
+    var it = std.mem.splitScalar(u8, dot_key, '.');
+    while (it.next()) |segment| {
+        switch (current) {
+            .object => |obj| current = obj.get(segment) orelse return null,
+            else => return null,
+        }
+    }
+
+    if (current != .string) return null;
+    return allocator.dupe(u8, current.string) catch null;
+}
+
+fn normalizeHealthHost(allocator: std.mem.Allocator, host: []const u8) ![]u8 {
+    if (host.len == 0 or
+        std.mem.eql(u8, host, "0.0.0.0") or
+        std.mem.eql(u8, host, "::") or
+        std.mem.eql(u8, host, "localhost"))
+    {
+        return allocator.dupe(u8, "127.0.0.1");
+    }
+    return allocator.dupe(u8, host);
 }
 
 fn isImportedStandalone(
@@ -125,7 +170,13 @@ fn deriveImportedStandaloneSnapshot(
     const port = readPortFromConfig(allocator, paths, component, name, port_key) orelse known.default_port;
     if (port == 0) return null;
 
-    const health = health_mod.check(allocator, "127.0.0.1", port, known.default_health_endpoint);
+    const configured_host = readStringFromConfig(allocator, paths, component, name, "host") orelse
+        allocator.dupe(u8, "127.0.0.1") catch return null;
+    defer allocator.free(configured_host);
+    const health_host = normalizeHealthHost(allocator, configured_host) catch return null;
+    defer allocator.free(health_host);
+
+    const health = health_mod.check(allocator, health_host, port, known.default_health_endpoint);
     const status = standaloneStatus(manager_snapshot, health.ok);
     var snapshot = manager_snapshot orelse Snapshot{ .status = status };
     snapshot.status = status;
@@ -160,4 +211,32 @@ test "standalone runtime metadata covers nullclaw and nullwatch" {
     try std.testing.expect(isStandaloneLaunchMode("nullwatch", "gateway", "serve"));
     try std.testing.expect(isStandaloneLaunchMode("nullwatch", "nullwatch", "serve"));
     try std.testing.expect(!isStandaloneLaunchMode("nullboiler", "gateway", "gateway"));
+}
+
+test "readPortFromConfig accepts string ports" {
+    const allocator = std.testing.allocator;
+    var fixture = try @import("../test_helpers.zig").TempPaths.init(allocator);
+    defer fixture.deinit();
+    try fixture.paths.ensureDirs();
+
+    const inst_dir = try fixture.paths.instanceDir(allocator, "nullwatch", "watch");
+    defer allocator.free(inst_dir);
+    try std_compat.fs.makeDirAbsolute(std.fs.path.dirname(inst_dir).?);
+    try std_compat.fs.makeDirAbsolute(inst_dir);
+
+    const config_path = try fixture.paths.instanceConfig(allocator, "nullwatch", "watch");
+    defer allocator.free(config_path);
+    const file = try std_compat.fs.createFileAbsolute(config_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("{\"port\":\"7711\",\"host\":\"::1\"}");
+
+    try std.testing.expectEqual(@as(u16, 7711), readPortFromConfig(allocator, fixture.paths, "nullwatch", "watch", "port").?);
+
+    const host = readStringFromConfig(allocator, fixture.paths, "nullwatch", "watch", "host").?;
+    defer allocator.free(host);
+    try std.testing.expectEqualStrings("::1", host);
+
+    const normalized = try normalizeHealthHost(allocator, "::");
+    defer allocator.free(normalized);
+    try std.testing.expectEqualStrings("127.0.0.1", normalized);
 }
