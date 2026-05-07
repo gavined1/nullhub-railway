@@ -142,25 +142,40 @@ fn compareVersionTags(a: []const u8, b: []const u8) std.math.Order {
 /// Returns the manifest JSON directly (the component owns its wizard definition).
 /// Returns null if the component is unknown or binary not found.
 /// Caller owns the returned memory.
-pub fn handleGetWizard(allocator: std.mem.Allocator, component_name: []const u8, paths: paths_mod.Paths, state: *state_mod.State) ?[]const u8 {
+pub fn handleGetWizard(
+    allocator: std.mem.Allocator,
+    component_name: []const u8,
+    target: []const u8,
+    paths: paths_mod.Paths,
+    state: *state_mod.State,
+) ?[]const u8 {
     // Verify the component is known
     if (registry.findKnownComponent(component_name) == null) return null;
 
+    const requested_version = query.valueAlloc(allocator, target, "version") catch null;
+    defer if (requested_version) |value| allocator.free(value);
+    const explicit_version = if (requested_version) |value|
+        value.len > 0 and !std.mem.eql(u8, value, "latest")
+    else
+        false;
+
     // Try existing binary first
-    if (findOrFetchComponentBinary(allocator, component_name, paths)) |bin_path| {
+    if (findOrFetchComponentBinaryForVersion(allocator, component_name, paths, requested_version)) |bin_path| {
         defer allocator.free(bin_path);
         if (component_cli.exportManifest(allocator, bin_path)) |json| {
             return augmentWizardManifest(allocator, component_name, json, state, paths) orelse json;
         } else |_| {}
-        // Existing binary doesn't support --export-manifest, try fetching latest
     }
 
-    // Download latest release and retry
-    if (fetchLatestComponentBinary(allocator, component_name, paths)) |bin_path| {
-        defer allocator.free(bin_path);
-        if (component_cli.exportManifest(allocator, bin_path)) |json| {
-            return augmentWizardManifest(allocator, component_name, json, state, paths) orelse json;
-        } else |_| {}
+    // Existing local/latest binary may be too old to export a manifest. For
+    // unpinned wizard requests, force a latest release fetch and retry.
+    if (!explicit_version) {
+        if (fetchLatestComponentBinary(allocator, component_name, paths)) |bin_path| {
+            defer allocator.free(bin_path);
+            if (component_cli.exportManifest(allocator, bin_path)) |json| {
+                return augmentWizardManifest(allocator, component_name, json, state, paths) orelse json;
+            } else |_| {}
+        }
     }
 
     return allocator.dupe(u8, "{\"error\":\"no compatible version found, check GitHub releases\"}") catch null;
@@ -390,7 +405,8 @@ fn appendMissingNullBoilerLinkSteps(
 
 fn isManagedServiceComponent(component_name: []const u8) bool {
     return std.mem.eql(u8, component_name, "nullboiler") or
-        std.mem.eql(u8, component_name, "nulltickets");
+        std.mem.eql(u8, component_name, "nulltickets") or
+        std.mem.eql(u8, component_name, "nullwatch");
 }
 
 fn managedServiceDefaultPort(component_name: []const u8, manifest: manifest_mod.Manifest) u16 {
@@ -681,16 +697,71 @@ fn findOrFetchComponentBinary(allocator: std.mem.Allocator, component: []const u
     return fetchLatestComponentBinary(allocator, component, paths);
 }
 
+fn findExactInstalledComponentBinary(
+    allocator: std.mem.Allocator,
+    component: []const u8,
+    paths: paths_mod.Paths,
+    version: []const u8,
+) ?[]const u8 {
+    const bin_path = paths.binary(allocator, component, version) catch return null;
+    if (std_compat.fs.openFileAbsolute(bin_path, .{})) |file| {
+        file.close();
+        return bin_path;
+    } else |_| {
+        allocator.free(bin_path);
+        return null;
+    }
+}
+
+fn findOrFetchComponentBinaryForVersion(
+    allocator: std.mem.Allocator,
+    component: []const u8,
+    paths: paths_mod.Paths,
+    requested_version: ?[]const u8,
+) ?[]const u8 {
+    const version = requested_version orelse return findOrFetchComponentBinary(allocator, component, paths);
+    if (version.len == 0 or std.mem.eql(u8, version, "latest")) {
+        return findOrFetchComponentBinary(allocator, component, paths);
+    }
+    if (findExactInstalledComponentBinary(allocator, component, paths, version)) |bin| {
+        return bin;
+    }
+    if (builtin.is_test) return null;
+    return fetchComponentBinaryByTag(allocator, component, paths, version);
+}
+
 fn fetchLatestComponentBinary(allocator: std.mem.Allocator, component: []const u8, paths: paths_mod.Paths) ?[]const u8 {
     const known = registry.findKnownComponent(component) orelse return null;
     var release = registry.fetchLatestRelease(allocator, known.repo) catch return null;
     defer release.deinit();
 
+    return fetchComponentBinaryFromRelease(allocator, component, paths, release.value);
+}
+
+fn fetchComponentBinaryByTag(
+    allocator: std.mem.Allocator,
+    component: []const u8,
+    paths: paths_mod.Paths,
+    version: []const u8,
+) ?[]const u8 {
+    const known = registry.findKnownComponent(component) orelse return null;
+    var release = registry.fetchReleaseByTag(allocator, known.repo, version) catch return null;
+    defer release.deinit();
+
+    return fetchComponentBinaryFromRelease(allocator, component, paths, release.value);
+}
+
+fn fetchComponentBinaryFromRelease(
+    allocator: std.mem.Allocator,
+    component: []const u8,
+    paths: paths_mod.Paths,
+    release: registry.ReleaseInfo,
+) ?[]const u8 {
     const platform_key = comptime platform.detect().toString();
-    const asset = registry.findAssetForComponentPlatform(allocator, release.value, component, platform_key) orelse return null;
+    const asset = registry.findAssetForComponentPlatform(allocator, release, component, platform_key) orelse return null;
 
     paths.ensureDirs() catch return null;
-    const bin_path = paths.binary(allocator, component, release.value.tag_name) catch return null;
+    const bin_path = paths.binary(allocator, component, release.tag_name) catch return null;
 
     downloader.downloadIfMissing(allocator, asset.browser_download_url, bin_path) catch {
         allocator.free(bin_path);
@@ -1309,6 +1380,27 @@ test "findInstalledComponentBinary finds binary in bin directory" {
     try std.testing.expectEqualStrings(bin_path, found.?);
 }
 
+test "findOrFetchComponentBinaryForVersion uses exact installed version" {
+    const allocator = std.testing.allocator;
+    var fixture = try test_helpers.TempPaths.init(allocator);
+    defer fixture.deinit();
+    try fixture.paths.ensureDirs();
+
+    const bin_path = try fixture.paths.binary(allocator, "nullboiler", "v2.0.0");
+    defer allocator.free(bin_path);
+
+    {
+        const file = try std_compat.fs.createFileAbsolute(bin_path, .{});
+        defer file.close();
+        try file.writeAll("#!/bin/sh\n");
+    }
+
+    const found = findOrFetchComponentBinaryForVersion(allocator, "nullboiler", fixture.paths, "v2.0.0");
+    try std.testing.expect(found != null);
+    defer allocator.free(found.?);
+    try std.testing.expectEqualStrings(bin_path, found.?);
+}
+
 test "handleGetWizard returns null for unknown component" {
     const allocator = std.testing.allocator;
     var fixture = try test_helpers.TempPaths.init(allocator);
@@ -1317,7 +1409,7 @@ test "handleGetWizard returns null for unknown component" {
     defer allocator.free(state_path);
     var state = state_mod.State.init(allocator, state_path);
     defer state.deinit();
-    const result = handleGetWizard(allocator, "nonexistent", fixture.paths, &state);
+    const result = handleGetWizard(allocator, "nonexistent", "/api/wizard/nonexistent", fixture.paths, &state);
     try std.testing.expect(result == null);
 }
 
@@ -1330,7 +1422,7 @@ test "handleGetWizard returns null when no binary found" {
     var state = state_mod.State.init(allocator, state_path);
     defer state.deinit();
     // nullclaw is a known component but there's no binary in test dirs
-    const result = handleGetWizard(allocator, "nullclaw", fixture.paths, &state);
+    const result = handleGetWizard(allocator, "nullclaw", "/api/wizard/nullclaw", fixture.paths, &state);
     try std.testing.expect(result == null);
 }
 
@@ -1563,6 +1655,61 @@ test "augmentWizardManifest picks next port for additional nullboiler instance" 
     try std.testing.expectEqualStrings("port", parsed.value.wizard.steps[0].id);
     const port = try std.fmt.parseInt(u16, parsed.value.wizard.steps[0].default_value, 10);
     try std.testing.expect(port > 44000);
+}
+
+test "augmentWizardManifest picks next port for additional nullwatch instance" {
+    const allocator = std.testing.allocator;
+    var fixture = try test_helpers.TempPaths.init(allocator);
+    defer fixture.deinit();
+    try fixture.paths.ensureDirs();
+
+    const state_path = try fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var state = state_mod.State.init(allocator, state_path);
+    defer state.deinit();
+    try state.addInstance("nullwatch", "watch-a", .{ .version = "v1.0.0" });
+
+    const inst_dir = try fixture.paths.instanceDir(allocator, "nullwatch", "watch-a");
+    defer allocator.free(inst_dir);
+    try std.fs.makePathAbsolute(inst_dir);
+    const config_path = try fixture.paths.instanceConfig(allocator, "nullwatch", "watch-a");
+    defer allocator.free(config_path);
+    {
+        const file = try std_compat.fs.createFileAbsolute(config_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("{\"port\":45000}\n");
+    }
+
+    const manifest_json =
+        \\{
+        \\  "schema_version": 1,
+        \\  "name": "nullwatch",
+        \\  "display_name": "NullWatch",
+        \\  "description": "Observability",
+        \\  "icon": "watch",
+        \\  "repo": "nullclaw/nullwatch",
+        \\  "platforms": {},
+        \\  "launch": { "command": "serve" },
+        \\  "health": { "endpoint": "/health", "port_from_config": "port" },
+        \\  "ports": [{ "name": "api", "config_key": "port", "default": 45000, "protocol": "http" }],
+        \\  "wizard": { "steps": [
+        \\    { "id": "port", "title": "Port", "type": "number", "default_value": "45000" }
+        \\  ] },
+        \\  "depends_on": [],
+        \\  "connects_to": []
+        \\}
+    ;
+
+    const rendered = augmentWizardManifest(allocator, "nullwatch", manifest_json, &state, fixture.paths) orelse
+        @panic("augmentWizardManifest");
+    defer allocator.free(rendered);
+
+    const parsed = try manifest_mod.parseManifest(allocator, rendered);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.wizard.steps.len);
+    try std.testing.expectEqualStrings("port", parsed.value.wizard.steps[0].id);
+    const port = try std.fmt.parseInt(u16, parsed.value.wizard.steps[0].default_value, 10);
+    try std.testing.expect(port > 45000);
 }
 
 test "prepareWizardBody injects tracker settings for nullboiler" {

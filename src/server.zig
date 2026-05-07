@@ -1102,7 +1102,7 @@ pub const Server = struct {
         if (wizard_api.isWizardPath(target)) {
             if (wizard_api.extractComponentName(target)) |comp_name| {
                 if (std.mem.eql(u8, method, "GET")) {
-                    if (wizard_api.handleGetWizard(allocator, comp_name, self.paths, self.state)) |json| {
+                    if (wizard_api.handleGetWizard(allocator, comp_name, target, self.paths, self.state)) |json| {
                         const status = if (std.mem.indexOf(u8, json, "\"error\"") != null)
                             "400 Bad Request"
                         else

@@ -8,10 +8,12 @@
   let {
     component = "",
     steps = [],
+    onVersionChange = (_version: string) => {},
     onComplete,
   } = $props<{
     component: string;
     steps: any[];
+    onVersionChange?: (version: string) => void;
     onComplete?: () => void;
   }>();
 
@@ -23,6 +25,7 @@
   let versions = $state<any[]>([]);
   let selectedVersion = $state("latest");
   let channels = $state<Record<string, Record<string, Record<string, any>>>>({});
+  let showAdvanced = $state(false);
   const instanceNameId = "wizard-instance-name";
 
   // Validation state
@@ -71,15 +74,33 @@
           versions = Array.isArray(data) ? data : [];
           if (versions.length > 0) {
             const rec = versions.find((v: any) => v.recommended);
-            selectedVersion = rec?.value || versions[0].value;
+            setSelectedVersion(rec?.value || versions[0].value);
           }
         })
         .catch(() => {
           versions = [{ value: "latest", label: "latest", recommended: true }];
-          selectedVersion = "latest";
+          setSelectedVersion("latest");
         });
     }
   });
+
+  function setSelectedVersion(version: string) {
+    const next = version || "latest";
+    if (selectedVersion === next) return;
+    selectedVersion = next;
+    resetWizardInputs();
+    onVersionChange(next);
+  }
+
+  function resetWizardInputs() {
+    answers = {};
+    channels = {};
+    providerValidationResults = [];
+    channelValidationResults = [];
+    validationError = "";
+    validationWarning = "";
+    showAdvanced = false;
+  }
 
   // Apply default values from steps
   $effect(() => {
@@ -159,8 +180,6 @@
         isStepVisible(s),
     ),
   );
-
-  let showAdvanced = $state(false);
 
   let providerStep = $derived(steps.find((s) => s.id === "provider"));
   let hasChannelsPage = $derived(component === "nullclaw");
@@ -423,7 +442,11 @@
       {#if versions.length > 0}
         <div class="version-select">
           <label for="version-picker">Version</label>
-          <select id="version-picker" bind:value={selectedVersion}>
+          <select
+            id="version-picker"
+            value={selectedVersion}
+            onchange={(e) => setSelectedVersion(e.currentTarget.value)}
+          >
             {#each versions as v, i}
               <option value={v.value}>
                 {v.label}{i === 0 ? " (latest, recommended)" : ""}

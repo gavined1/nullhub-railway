@@ -55,7 +55,8 @@ export const api = {
     request<any>(`/usage?window=${window}`),
   getComponents: () => request<any>('/components'),
   getInstances: () => request<any>('/instances'),
-  getWizard: (component: string) => request<any>(`/wizard/${component}`),
+  getWizard: (component: string, version = '') =>
+    request<any>(withQuery(`/wizard/${component}`, { version })),
   getVersions: (component: string) => request<any>(`/wizard/${component}/versions`),
   getWizardModels: (component: string, provider: string, apiKey = '') =>
     request<any>(`/wizard/${component}/models`, {
