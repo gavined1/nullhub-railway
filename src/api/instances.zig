@@ -32,6 +32,139 @@ const default_tracker_prompt_template =
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+fn defaultLaunchModeForComponent(component: []const u8) []const u8 {
+    if (registry.findKnownComponent(component)) |known| return known.default_launch_command;
+    return "gateway";
+}
+
+fn isLegacyDefaultLaunchMode(component: []const u8, launch_mode: []const u8) bool {
+    const default_launch = defaultLaunchModeForComponent(component);
+    return !std.mem.eql(u8, default_launch, "gateway") and std.mem.eql(u8, launch_mode, "gateway");
+}
+
+const StartBinary = struct {
+    path: []const u8,
+    version: []const u8,
+    version_owned: bool = false,
+
+    fn deinit(self: StartBinary, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.version_owned) allocator.free(self.version);
+    }
+};
+
+fn persistStartVersion(
+    s: *state_mod.State,
+    component: []const u8,
+    name: []const u8,
+    entry: state_mod.InstanceEntry,
+    version: []const u8,
+) !void {
+    const updated = try s.updateInstance(component, name, .{
+        .version = version,
+        .auto_start = entry.auto_start,
+        .launch_mode = entry.launch_mode,
+        .verbose = entry.verbose,
+    });
+    if (!updated) return error.StateError;
+    s.save() catch return error.StateError;
+}
+
+fn resolveStandaloneStartBinary(
+    allocator: std.mem.Allocator,
+    s: *state_mod.State,
+    paths: paths_mod.Paths,
+    component: []const u8,
+    name: []const u8,
+    entry: state_mod.InstanceEntry,
+) !StartBinary {
+    if (local_binary.stageDevLocal(allocator, paths, component)) |dest_bin| {
+        persistStartVersion(s, component, name, entry, local_binary.dev_local_version) catch |err| {
+            allocator.free(dest_bin);
+            return err;
+        };
+        return .{ .path = dest_bin, .version = local_binary.dev_local_version };
+    }
+
+    const known = registry.findKnownComponent(component) orelse return error.NoPlatformAsset;
+    var release = registry.fetchLatestRelease(allocator, known.repo) catch return error.FetchFailed;
+    defer release.deinit();
+
+    const platform_key = comptime platform.detect().toString();
+    const asset = registry.findAssetForComponentPlatform(allocator, release.value, component, platform_key) orelse return error.NoPlatformAsset;
+
+    const version = try allocator.dupe(u8, release.value.tag_name);
+    errdefer allocator.free(version);
+    const bin_path = try paths.binary(allocator, component, version);
+    errdefer allocator.free(bin_path);
+
+    downloader.downloadIfMissing(allocator, asset.browser_download_url, bin_path) catch return error.DownloadFailed;
+    persistStartVersion(s, component, name, entry, version) catch |err| return err;
+
+    return .{ .path = bin_path, .version = version, .version_owned = true };
+}
+
+fn resolveStartBinary(
+    allocator: std.mem.Allocator,
+    s: *state_mod.State,
+    paths: paths_mod.Paths,
+    component: []const u8,
+    name: []const u8,
+    entry: state_mod.InstanceEntry,
+) !StartBinary {
+    if (std.mem.eql(u8, entry.version, "standalone")) {
+        return resolveStandaloneStartBinary(allocator, s, paths, component, name, entry);
+    }
+
+    local_binary.refreshStagedDevLocal(allocator, paths, component, entry.version);
+    return .{
+        .path = try paths.binary(allocator, component, entry.version),
+        .version = entry.version,
+    };
+}
+
+fn startBinaryError(err: anyerror) ApiResponse {
+    return switch (err) {
+        error.FetchFailed => .{
+            .status = "502 Bad Gateway",
+            .content_type = "application/json",
+            .body = "{\"error\":\"failed to fetch latest release\"}",
+        },
+        error.NoPlatformAsset => .{
+            .status = "502 Bad Gateway",
+            .content_type = "application/json",
+            .body = "{\"error\":\"no platform asset for latest version\"}",
+        },
+        error.DownloadFailed => .{
+            .status = "502 Bad Gateway",
+            .content_type = "application/json",
+            .body = "{\"error\":\"failed to download latest binary\"}",
+        },
+        else => helpers.serverError(),
+    };
+}
+
+fn isExternalStandaloneRunning(
+    allocator: std.mem.Allocator,
+    paths: paths_mod.Paths,
+    manager: *manager_mod.Manager,
+    component: []const u8,
+    name: []const u8,
+    entry: state_mod.InstanceEntry,
+) bool {
+    if (manager.getStatus(component, name) != null) return false;
+    const snapshot = instance_runtime.resolve(allocator, paths, manager, component, name, entry);
+    return snapshot.status == .running;
+}
+
+fn externalStandaloneConflict() ApiResponse {
+    return .{
+        .status = "409 Conflict",
+        .content_type = "application/json",
+        .body = "{\"error\":\"instance is running outside nullhub supervision\"}",
+    };
+}
+
 const FetchedJsonValue = struct {
     bytes: []u8,
     parsed: std.json.Parsed(std.json.Value),
@@ -508,6 +641,17 @@ fn listNullBoilersLocked(
     return integration_mod.listNullBoilers(allocator, state, paths);
 }
 
+fn listNullWatchLocked(
+    allocator: std.mem.Allocator,
+    mutex: *std_compat.sync.Mutex,
+    state: *state_mod.State,
+    paths: paths_mod.Paths,
+) ![]integration_mod.NullWatchConfig {
+    mutex.lock();
+    defer mutex.unlock();
+    return integration_mod.listNullWatch(allocator, state, paths);
+}
+
 const PipelineSummary = struct {
     id: []const u8,
     name: []const u8,
@@ -520,6 +664,19 @@ const TrackerIntegrationOption = struct {
     port: u16,
     running: bool,
     pipelines: []const PipelineSummary = &.{},
+};
+
+const WatchIntegrationOption = struct {
+    name: []const u8,
+    host: []const u8,
+    port: u16,
+    running: bool,
+};
+
+const ClawIntegrationOption = struct {
+    name: []const u8,
+    running: bool,
+    linked: bool,
 };
 
 fn fetchPipelineSummaries(allocator: std.mem.Allocator, url: []const u8, bearer_token: ?[]const u8) ?[]PipelineSummary {
@@ -2102,6 +2259,9 @@ pub fn handleGet(allocator: std.mem.Allocator, s: *state_mod.State, manager: *ma
 /// POST /api/instances/{component}/{name}/start
 pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *manager_mod.Manager, paths: paths_mod.Paths, component: []const u8, name: []const u8, body: []const u8) ApiResponse {
     const entry = s.getInstance(component, name) orelse return notFound();
+    if (isExternalStandaloneRunning(allocator, paths, manager, component, name, entry)) {
+        return externalStandaloneConflict();
+    }
 
     _ = nullclaw_web_channel.ensureNullclawWebChannelConfig(
         allocator,
@@ -2126,6 +2286,7 @@ pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *
     };
     var launch_cmd: []const u8 = entry.launch_mode;
     var launch_verbose = entry.verbose;
+    var launch_mode_overridden = false;
     var parsed_body: ?std.json.Parsed(StartBody) = null;
     defer if (parsed_body) |*pb| pb.deinit();
     if (body.len > 0) {
@@ -2136,16 +2297,18 @@ pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *
             .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
         ) catch null;
         if (parsed_body) |pb| {
-            if (pb.value.launch_mode) |mode| launch_cmd = mode;
+            if (pb.value.launch_mode) |mode| {
+                launch_cmd = mode;
+                launch_mode_overridden = true;
+            }
             if (pb.value.verbose) |verbose| launch_verbose = verbose;
         }
     }
 
-    local_binary.refreshStagedDevLocal(allocator, paths, component, entry.version);
-
-    // Resolve binary path
-    const bin_path = paths.binary(allocator, component, entry.version) catch return helpers.serverError();
-    defer allocator.free(bin_path);
+    const start_binary = resolveStartBinary(allocator, s, paths, component, name, entry) catch |err| return startBinaryError(err);
+    defer start_binary.deinit(allocator);
+    const bin_path = start_binary.path;
+    const current_version = start_binary.version;
 
     // Read manifest from binary to get health endpoint and port, falling back
     // to registry/config defaults for older binaries without manifest support.
@@ -2153,6 +2316,9 @@ pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *
     var health_endpoint: []const u8 = if (known_component) |known| known.default_health_endpoint else "/health";
     var port: u16 = if (known_component) |known| known.default_port else 0;
     var port_from_config: []const u8 = "";
+    var manifest_launch_command: []const u8 = "";
+    var manifest_launch_mode: ?[]const u8 = null;
+    defer if (manifest_launch_mode) |mode| allocator.free(mode);
     const manifest_json = component_cli.exportManifest(allocator, bin_path) catch null;
     var parsed_manifest: ?std.json.Parsed(manifest_mod.Manifest) = null;
     if (manifest_json) |mj| {
@@ -2161,10 +2327,35 @@ pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *
             health_endpoint = pm.value.health.endpoint;
             port_from_config = pm.value.health.port_from_config;
             if (pm.value.ports.len > 0) port = pm.value.ports[0].default;
+            manifest_launch_command = pm.value.launch.command;
+            manifest_launch_mode = launch_args_mod.fromManifestLaunch(
+                allocator,
+                component,
+                pm.value.launch.command,
+                pm.value.launch.args,
+            ) catch null;
         }
     }
     defer if (manifest_json) |mj| allocator.free(mj);
     defer if (parsed_manifest) |*pm| pm.deinit();
+
+    if (!launch_mode_overridden) {
+        if (manifest_launch_mode) |mode| {
+            const should_normalize_launch =
+                (std.mem.eql(u8, launch_cmd, manifest_launch_command) and !std.mem.eql(u8, launch_cmd, mode)) or
+                isLegacyDefaultLaunchMode(component, launch_cmd);
+            if (should_normalize_launch) {
+                launch_cmd = registry.normalizeLaunchCommand(component, mode);
+                _ = s.updateInstance(component, name, .{
+                    .version = current_version,
+                    .auto_start = entry.auto_start,
+                    .launch_mode = launch_cmd,
+                    .verbose = entry.verbose,
+                }) catch {};
+                s.save() catch {};
+            }
+        }
+    }
 
     // Try to read actual port from instance config.json using port_from_config key.
     // If manifest probing failed, fall back to the common service port keys.
@@ -2196,15 +2387,21 @@ pub fn handleStart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *
 }
 
 /// POST /api/instances/{component}/{name}/stop
-pub fn handleStop(s: *state_mod.State, manager: *manager_mod.Manager, component: []const u8, name: []const u8) ApiResponse {
-    _ = s.getInstance(component, name) orelse return notFound();
+pub fn handleStop(allocator: std.mem.Allocator, s: *state_mod.State, manager: *manager_mod.Manager, paths: paths_mod.Paths, component: []const u8, name: []const u8) ApiResponse {
+    const entry = s.getInstance(component, name) orelse return notFound();
+    if (isExternalStandaloneRunning(allocator, paths, manager, component, name, entry)) {
+        return externalStandaloneConflict();
+    }
     manager.stopInstance(component, name) catch return helpers.serverError();
     return jsonOk("{\"status\":\"stopped\"}");
 }
 
 /// POST /api/instances/{component}/{name}/restart
 pub fn handleRestart(allocator: std.mem.Allocator, s: *state_mod.State, manager: *manager_mod.Manager, paths: paths_mod.Paths, component: []const u8, name: []const u8, body: []const u8) ApiResponse {
-    _ = s.getInstance(component, name) orelse return notFound();
+    const entry = s.getInstance(component, name) orelse return notFound();
+    if (isExternalStandaloneRunning(allocator, paths, manager, component, name, entry)) {
+        return externalStandaloneConflict();
+    }
     manager.stopInstance(component, name) catch {};
     return handleStart(allocator, s, manager, paths, component, name, body);
 }
@@ -3480,15 +3677,10 @@ pub fn handleImport(allocator: std.mem.Allocator, s: *state_mod.State, paths: pa
     std_compat.fs.symLinkAbsolute(dot_dir, inst_dir, .{ .is_directory = true }) catch return helpers.serverError();
 
     // 5. Register in state
-    const default_launch_mode = if (registry.findKnownComponent(component)) |known|
-        known.default_launch_command
-    else
-        "gateway";
-
     s.addInstance(component, "default", .{
         .version = version,
         .auto_start = false,
-        .launch_mode = default_launch_mode,
+        .launch_mode = defaultLaunchModeForComponent(component),
         .verbose = false,
     }) catch {
         std_compat.fs.deleteFileAbsolute(inst_dir) catch {};
@@ -3553,6 +3745,94 @@ fn handleIntegrationGet(
     component: []const u8,
     name: []const u8,
 ) ApiResponse {
+    if (std.mem.eql(u8, component, "nullclaw")) {
+        var link = integration_mod.loadNullClawTelemetryLink(allocator, paths, name) catch |err| switch (err) {
+            error.NotFound => return notFound(),
+            else => return helpers.serverError(),
+        };
+        defer link.deinit(allocator);
+        const watches = listNullWatchLocked(allocator, mutex, s, paths) catch return helpers.serverError();
+        defer integration_mod.deinitNullWatchConfigs(allocator, watches);
+        const linked = integration_mod.findNullWatchByEndpoint(watches, link.endpoint);
+
+        var watch_options: std.ArrayListUnmanaged(WatchIntegrationOption) = .empty;
+        defer watch_options.deinit(allocator);
+        for (watches) |watch| {
+            const is_running = blk: {
+                const status = getStatusLocked(mutex, manager, "nullwatch", watch.name) orelse break :blk false;
+                break :blk status.status == .running;
+            };
+            watch_options.append(allocator, .{
+                .name = watch.name,
+                .host = watch.host,
+                .port = watch.port,
+                .running = is_running,
+            }) catch return helpers.serverError();
+        }
+
+        const body = std.json.Stringify.valueAlloc(allocator, .{
+            .kind = "nullclaw",
+            .configured = link.configured,
+            .linked_watch = if (linked) |watch| .{
+                .name = watch.name,
+                .host = watch.host,
+                .port = watch.port,
+            } else null,
+            .available_watches = watch_options.items,
+            .current_link = if (link.endpoint) |endpoint| .{
+                .endpoint = endpoint,
+                .service_name = link.service_name orelse "",
+                .auth_header = link.auth_configured,
+                .source_header = link.source_header_configured,
+            } else null,
+        }, .{ .emit_null_optional_fields = false }) catch return helpers.serverError();
+        return jsonOk(body);
+    }
+
+    if (std.mem.eql(u8, component, "nullwatch")) {
+        var watch_cfg = integration_mod.loadNullWatchConfig(allocator, paths, name) catch null orelse return notFound();
+        defer integration_mod.deinitNullWatchConfig(allocator, &watch_cfg);
+
+        const claw_names_opt = blk: {
+            mutex.lock();
+            defer mutex.unlock();
+            break :blk s.instanceNames("nullclaw") catch return helpers.serverError();
+        };
+        defer if (claw_names_opt) |claw_names| s.allocator.free(claw_names);
+
+        var claw_options: std.ArrayListUnmanaged(ClawIntegrationOption) = .empty;
+        defer claw_options.deinit(allocator);
+        if (claw_names_opt) |claw_names| {
+            for (claw_names) |claw_name| {
+                const is_running = blk: {
+                    const status = getStatusLocked(mutex, manager, "nullclaw", claw_name) orelse break :blk false;
+                    break :blk status.status == .running;
+                };
+                const is_linked = blk: {
+                    var link = integration_mod.loadNullClawTelemetryLink(allocator, paths, claw_name) catch break :blk false;
+                    defer link.deinit(allocator);
+                    break :blk integration_mod.findNullWatchByEndpoint(&.{watch_cfg}, link.endpoint) != null;
+                };
+                claw_options.append(allocator, .{
+                    .name = claw_name,
+                    .running = is_running,
+                    .linked = is_linked,
+                }) catch return helpers.serverError();
+            }
+        }
+
+        const body = std.json.Stringify.valueAlloc(allocator, .{
+            .kind = "nullwatch",
+            .watch = .{
+                .name = watch_cfg.name,
+                .host = watch_cfg.host,
+                .port = watch_cfg.port,
+            },
+            .available_claws = claw_options.items,
+        }, .{ .emit_null_optional_fields = false }) catch return helpers.serverError();
+        return jsonOk(body);
+    }
+
     if (std.mem.eql(u8, component, "nullboiler")) {
         var boiler_cfg = integration_mod.loadNullBoilerConfig(allocator, paths, name) catch null orelse return notFound();
         defer integration_mod.deinitNullBoilerConfig(allocator, &boiler_cfg);
@@ -3724,6 +4004,31 @@ fn handleIntegrationGet(
     return notFound();
 }
 
+fn linkNullClawTelemetry(
+    allocator: std.mem.Allocator,
+    s: *state_mod.State,
+    manager: *manager_mod.Manager,
+    mutex: *std_compat.sync.Mutex,
+    paths: paths_mod.Paths,
+    claw_name: []const u8,
+    watch_cfg: integration_mod.NullWatchConfig,
+) ApiResponse {
+    integration_mod.linkNullClawToNullWatch(allocator, paths, claw_name, watch_cfg) catch |err| switch (err) {
+        error.NotFound => return notFound(),
+        else => return helpers.serverError(),
+    };
+
+    if (getStatusLocked(mutex, manager, "nullclaw", claw_name)) |status| {
+        if (status.status == .running) {
+            mutex.lock();
+            defer mutex.unlock();
+            return handleRestart(allocator, s, manager, paths, "nullclaw", claw_name, "");
+        }
+    }
+
+    return jsonOk("{\"status\":\"linked\"}");
+}
+
 fn handleIntegrationPost(
     allocator: std.mem.Allocator,
     s: *state_mod.State,
@@ -3734,7 +4039,52 @@ fn handleIntegrationPost(
     name: []const u8,
     body: []const u8,
 ) ApiResponse {
-    if (!std.mem.eql(u8, component, "nullboiler")) return badRequest("{\"error\":\"integration updates are only supported for nullboiler\"}");
+    if (std.mem.eql(u8, component, "nullclaw")) {
+        const watch_cfg = blk: {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            }) catch return badRequest("{\"error\":\"invalid JSON body\"}");
+            defer parsed.deinit();
+            if (parsed.value != .object) return badRequest("{\"error\":\"invalid JSON body\"}");
+            const watch_name = if (parsed.value.object.get("watch_instance")) |value|
+                if (value == .string and value.string.len > 0) value.string else null
+            else
+                null;
+            if (watch_name == null) return badRequest("{\"error\":\"watch_instance is required\"}");
+            break :blk integration_mod.loadNullWatchConfig(allocator, paths, watch_name.?) catch null orelse return notFound();
+        };
+        defer {
+            var owned_cfg = watch_cfg;
+            integration_mod.deinitNullWatchConfig(allocator, &owned_cfg);
+        }
+
+        return linkNullClawTelemetry(allocator, s, manager, mutex, paths, name, watch_cfg);
+    }
+
+    if (std.mem.eql(u8, component, "nullwatch")) {
+        const claw_name = blk: {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            }) catch return badRequest("{\"error\":\"invalid JSON body\"}");
+            defer parsed.deinit();
+            if (parsed.value != .object) return badRequest("{\"error\":\"invalid JSON body\"}");
+            const value = if (parsed.value.object.get("claw_instance")) |item|
+                if (item == .string and item.string.len > 0) item.string else null
+            else
+                null;
+            if (value == null) return badRequest("{\"error\":\"claw_instance is required\"}");
+            break :blk allocator.dupe(u8, value.?) catch return helpers.serverError();
+        };
+        defer allocator.free(claw_name);
+
+        var watch_cfg = integration_mod.loadNullWatchConfig(allocator, paths, name) catch null orelse return notFound();
+        defer integration_mod.deinitNullWatchConfig(allocator, &watch_cfg);
+        return linkNullClawTelemetry(allocator, s, manager, mutex, paths, claw_name, watch_cfg);
+    }
+
+    if (!std.mem.eql(u8, component, "nullboiler")) return badRequest("{\"error\":\"integration updates are only supported for nullclaw, nullwatch, and nullboiler\"}");
 
     const tracker_cfg = blk: {
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
@@ -4174,7 +4524,7 @@ pub fn dispatch(
         if (!std.mem.eql(u8, method, "POST")) return methodNotAllowed();
 
         if (std.mem.eql(u8, action, "start")) return handleStart(allocator, s, manager, paths, parsed.component, parsed.name, body);
-        if (std.mem.eql(u8, action, "stop")) return handleStop(s, manager, parsed.component, parsed.name);
+        if (std.mem.eql(u8, action, "stop")) return handleStop(allocator, s, manager, paths, parsed.component, parsed.name);
         if (std.mem.eql(u8, action, "restart")) return handleRestart(allocator, s, manager, paths, parsed.component, parsed.name, body);
 
         return notFound();
@@ -4217,6 +4567,15 @@ const TestManagerCtx = struct {
         self.fixture.deinit();
     }
 };
+
+test "component default launch mode uses registry metadata" {
+    try std.testing.expectEqualStrings("gateway", defaultLaunchModeForComponent("nullclaw"));
+    try std.testing.expectEqualStrings("serve", defaultLaunchModeForComponent("nullwatch"));
+    try std.testing.expectEqualStrings("gateway", defaultLaunchModeForComponent("unknown-component"));
+    try std.testing.expect(isLegacyDefaultLaunchMode("nullwatch", "gateway"));
+    try std.testing.expect(!isLegacyDefaultLaunchMode("nullwatch", "serve"));
+    try std.testing.expect(!isLegacyDefaultLaunchMode("nullclaw", "gateway"));
+}
 
 fn writeTestInstanceConfig(
     allocator: std.mem.Allocator,
@@ -4735,6 +5094,93 @@ test "handleStart keeps gateway instances on their HTTP health port" {
     mctx.manager.stopInstance("nullclaw", "my-agent") catch {};
 }
 
+test "handleStart normalizes manifest binary command to runnable launch args" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "watch", .{ .version = "1.0.0", .launch_mode = "nullwatch" });
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "watch", "{\"port\":43124}");
+    try writeTestBinary(
+        allocator,
+        mctx.paths,
+        "nullwatch",
+        "1.0.0",
+        \\#!/bin/sh
+        \\set -eu
+        \\if [ "$1" = "--export-manifest" ]; then
+        \\  printf '%s\n' '{"launch":{"command":"nullwatch","args":["serve"]},"health":{"endpoint":"/health","port_from_config":"port"},"ports":[{"name":"api","config_key":"port","default":7710,"protocol":"http"}]}'
+        \\  exit 0
+        \\fi
+        \\sleep 60
+        ,
+    );
+
+    const resp = handleStart(allocator, &s, &mctx.manager, mctx.paths, "nullwatch", "watch", "");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+
+    const entry = s.getInstance("nullwatch", "watch").?;
+    try std.testing.expectEqualStrings("serve", entry.launch_mode);
+
+    const status = mctx.manager.getStatus("nullwatch", "watch").?;
+    try std.testing.expectEqual(manager_mod.Status.starting, status.status);
+    try std.testing.expectEqual(@as(u16, 43124), status.port);
+    const inst = mctx.manager.instances.get("nullwatch/watch").?;
+    try std.testing.expectEqual(@as(usize, 1), inst.launch_args.len);
+    try std.testing.expectEqualStrings("serve", inst.launch_args[0]);
+
+    mctx.manager.stopInstance("nullwatch", "watch") catch {};
+}
+
+test "handleStart normalizes legacy default launch mode for nullwatch" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "watch", .{ .version = "1.0.0", .launch_mode = "gateway" });
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "watch", "{\"port\":43125}");
+    try writeTestBinary(
+        allocator,
+        mctx.paths,
+        "nullwatch",
+        "1.0.0",
+        \\#!/bin/sh
+        \\set -eu
+        \\if [ "$1" = "--export-manifest" ]; then
+        \\  printf '%s\n' '{"launch":{"command":"nullwatch","args":["serve"]},"health":{"endpoint":"/health","port_from_config":"port"},"ports":[{"name":"api","config_key":"port","default":7710,"protocol":"http"}]}'
+        \\  exit 0
+        \\fi
+        \\sleep 60
+        ,
+    );
+
+    const resp = handleStart(allocator, &s, &mctx.manager, mctx.paths, "nullwatch", "watch", "");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+
+    const entry = s.getInstance("nullwatch", "watch").?;
+    try std.testing.expectEqualStrings("serve", entry.launch_mode);
+    const inst = mctx.manager.instances.get("nullwatch/watch").?;
+    try std.testing.expectEqualStrings("serve", inst.launch_args[0]);
+
+    mctx.manager.stopInstance("nullwatch", "watch") catch {};
+}
+
 test "handleStop returns 200 for existing instance" {
     const allocator = std.testing.allocator;
     var state_fixture = try test_helpers.TempPaths.init(allocator);
@@ -4748,7 +5194,7 @@ test "handleStop returns 200 for existing instance" {
 
     try s.addInstance("nullclaw", "my-agent", .{ .version = "1.0.0" });
 
-    const resp = handleStop(&s, &mctx.manager, "nullclaw", "my-agent");
+    const resp = handleStop(allocator, &s, &mctx.manager, mctx.paths, "nullclaw", "my-agent");
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expectEqualStrings("{\"status\":\"stopped\"}", resp.body);
 }
@@ -5586,6 +6032,204 @@ test "dispatch routes nulltickets tickets action to managed instances only" {
         "{\"method\":\"POST\",\"path\":\"/store/default/key\"}",
     ).?;
     try std.testing.expectEqualStrings("400 Bad Request", unsupported.status);
+}
+
+test "dispatch routes GET integration action for nullclaw nullwatch telemetry" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "observer-a", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "my-agent", .{ .version = "1.0.0" });
+
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "observer-a", "{\"host\":\"127.0.0.1\",\"port\":7711,\"api_token\":\"watch-token\"}");
+    try writeTestInstanceConfig(
+        allocator,
+        mctx.paths,
+        "nullclaw",
+        "my-agent",
+        "{\"diagnostics\":{\"backend\":\"otel\",\"otel\":{\"endpoint\":\"http://127.0.0.1:7711\",\"service_name\":\"nullclaw/my-agent\",\"headers\":{\"Authorization\":\"Bearer watch-token\",\"x-nullwatch-source\":\"nullclaw\"}}}}",
+    );
+
+    const resp = dispatch(allocator, &s, &mctx.manager, &mctx.mutex, mctx.paths, "GET", "/api/instances/nullclaw/my-agent/integration", "").?;
+    defer allocator.free(resp.body);
+
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("nullclaw", parsed.value.object.get("kind").?.string);
+    try std.testing.expect(parsed.value.object.get("configured").?.bool);
+    const linked = parsed.value.object.get("linked_watch").?.object;
+    try std.testing.expectEqualStrings("observer-a", linked.get("name").?.string);
+    try std.testing.expectEqual(@as(i64, 7711), linked.get("port").?.integer);
+    const current_link = parsed.value.object.get("current_link").?.object;
+    try std.testing.expectEqualStrings("http://127.0.0.1:7711", current_link.get("endpoint").?.string);
+    try std.testing.expectEqualStrings("nullclaw/my-agent", current_link.get("service_name").?.string);
+    try std.testing.expect(current_link.get("auth_header").?.bool);
+    try std.testing.expect(current_link.get("source_header").?.bool);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("available_watches").?.array.items.len);
+}
+
+test "dispatch routes POST integration action for nullclaw links nullwatch" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "observer-a", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "my-agent", .{ .version = "1.0.0" });
+
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "observer-a", "{\"host\":\"0.0.0.0\",\"port\":7712,\"api_token\":\"watch-token\"}");
+    try writeTestInstanceConfig(
+        allocator,
+        mctx.paths,
+        "nullclaw",
+        "my-agent",
+        "{\"diagnostics\":{\"backend\":\"jsonl\",\"log_tool_calls\":true,\"otel\":{\"service_name\":\"nullclaw\",\"headers\":{\"Authorization\":\"Bearer old\"}}}}",
+    );
+
+    const resp = dispatch(
+        allocator,
+        &s,
+        &mctx.manager,
+        &mctx.mutex,
+        mctx.paths,
+        "POST",
+        "/api/instances/nullclaw/my-agent/integration",
+        "{\"watch_instance\":\"observer-a\"}",
+    ).?;
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+
+    const config_path = try mctx.paths.instanceConfig(allocator, "nullclaw", "my-agent");
+    defer allocator.free(config_path);
+    const config_bytes = try std.fs.readFileAbsolute(allocator, config_path, 1024 * 1024);
+    defer allocator.free(config_bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const diagnostics = parsed.value.object.get("diagnostics").?.object;
+    try std.testing.expectEqualStrings("otel", diagnostics.get("backend").?.string);
+    try std.testing.expect(diagnostics.get("log_tool_calls").?.bool);
+    const otel = diagnostics.get("otel").?.object;
+    try std.testing.expectEqualStrings("http://127.0.0.1:7712", otel.get("endpoint").?.string);
+    try std.testing.expectEqualStrings("nullclaw/my-agent", otel.get("service_name").?.string);
+    const headers = otel.get("headers").?.object;
+    try std.testing.expectEqualStrings("Bearer watch-token", headers.get("Authorization").?.string);
+    try std.testing.expectEqualStrings("nullclaw", headers.get("x-nullwatch-source").?.string);
+}
+
+test "dispatch routes GET integration action for nullwatch lists linked nullclaws" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "observer-a", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "linked-agent", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "plain-agent", .{ .version = "1.0.0" });
+
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "observer-a", "{\"port\":7711}");
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullclaw", "linked-agent", "{\"diagnostics\":{\"backend\":\"otel\",\"otel\":{\"endpoint\":\"http://127.0.0.1:7711\",\"service_name\":\"nullclaw/linked-agent\"}}}");
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullclaw", "plain-agent", "{\"diagnostics\":{\"backend\":\"jsonl\"}}");
+
+    const resp = dispatch(allocator, &s, &mctx.manager, &mctx.mutex, mctx.paths, "GET", "/api/instances/nullwatch/observer-a/integration", "").?;
+    defer allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("nullwatch", parsed.value.object.get("kind").?.string);
+    const claws = parsed.value.object.get("available_claws").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), claws.len);
+
+    var linked_found = false;
+    var plain_found = false;
+    for (claws) |claw| {
+        const obj = claw.object;
+        if (std.mem.eql(u8, obj.get("name").?.string, "linked-agent")) {
+            linked_found = obj.get("linked").?.bool;
+        }
+        if (std.mem.eql(u8, obj.get("name").?.string, "plain-agent")) {
+            plain_found = !obj.get("linked").?.bool;
+        }
+    }
+    try std.testing.expect(linked_found);
+    try std.testing.expect(plain_found);
+}
+
+test "dispatch routes POST integration action for nullwatch links selected nullclaw" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "observer-a", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "my-agent", .{ .version = "1.0.0" });
+
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "observer-a", "{\"port\":7713}");
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullclaw", "my-agent", "{\"diagnostics\":{\"backend\":\"jsonl\"}}");
+
+    const resp = dispatch(
+        allocator,
+        &s,
+        &mctx.manager,
+        &mctx.mutex,
+        mctx.paths,
+        "POST",
+        "/api/instances/nullwatch/observer-a/integration",
+        "{\"claw_instance\":\"my-agent\"}",
+    ).?;
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+
+    const config_path = try mctx.paths.instanceConfig(allocator, "nullclaw", "my-agent");
+    defer allocator.free(config_path);
+    const config_bytes = try std.fs.readFileAbsolute(allocator, config_path, 1024 * 1024);
+    defer allocator.free(config_bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const diagnostics = parsed.value.object.get("diagnostics").?.object;
+    try std.testing.expectEqualStrings("otel", diagnostics.get("backend").?.string);
+    const otel = diagnostics.get("otel").?.object;
+    try std.testing.expectEqualStrings("http://127.0.0.1:7713", otel.get("endpoint").?.string);
+    try std.testing.expectEqualStrings("nullclaw/my-agent", otel.get("service_name").?.string);
 }
 
 test "dispatch routes POST integration action for nullboiler" {

@@ -1,13 +1,10 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const http_proxy = @import("proxy.zig");
 const Allocator = std.mem.Allocator;
 const query_api = @import("query.zig");
 
-const Response = struct {
-    status: []const u8,
-    content_type: []const u8,
-    body: []const u8,
-};
+const Response = http_proxy.Response;
 
 const prefix = "/api/orchestration";
 const store_prefix = "/api/orchestration/store";
@@ -40,7 +37,7 @@ const Backend = enum {
 
 pub fn isProxyPath(target: []const u8) bool {
     const clean = query_api.stripTarget(target);
-    return std.mem.eql(u8, clean, prefix) or std.mem.startsWith(u8, clean, prefix ++ "/");
+    return http_proxy.isPathInNamespace(clean, prefix);
 }
 
 fn isStorePath(target: []const u8) bool {
@@ -113,9 +110,6 @@ pub fn handle(allocator: Allocator, method: []const u8, target: []const u8, body
     const resolved = resolveProxyTarget(target, cfg) orelse
         return .{ .status = "503 Service Unavailable", .content_type = "application/json", .body = backend.notConfiguredBody() };
 
-    const http_method = parseMethod(method) orelse
-        return .{ .status = "405 Method Not Allowed", .content_type = "application/json", .body = "{\"error\":\"method not allowed\"}" };
-
     var forwarded = forwardedTarget(allocator, target) catch
         return .{ .status = "500 Internal Server Error", .content_type = "application/json", .body = "{\"error\":\"internal error\"}" };
     defer forwarded.deinit(allocator);
@@ -123,47 +117,14 @@ pub fn handle(allocator: Allocator, method: []const u8, target: []const u8, body
     const proxied_path = forwarded.value[prefix.len..];
     const path = if (proxied_path.len == 0) "/" else proxied_path;
 
-    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ resolved.base_url, path }) catch
-        return .{ .status = "500 Internal Server Error", .content_type = "application/json", .body = "{\"error\":\"internal error\"}" };
-    defer allocator.free(url);
-
-    var auth_header: ?[]const u8 = null;
-    defer if (auth_header) |value| allocator.free(value);
-    var header_buf: [1]std.http.Header = undefined;
-    const extra_headers: []const std.http.Header = if (resolved.token) |token| blk: {
-        auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{token}) catch
-            return .{ .status = "500 Internal Server Error", .content_type = "application/json", .body = "{\"error\":\"internal error\"}" };
-        header_buf[0] = .{ .name = "Authorization", .value = auth_header.? };
-        break :blk header_buf[0..1];
-    } else &.{};
-
-    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
-    defer client.deinit();
-
-    var response_body: std.Io.Writer.Allocating = .init(allocator);
-    defer response_body.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = http_method,
-        .payload = if (body.len > 0) body else null,
-        .response_writer = &response_body.writer,
-        .extra_headers = extra_headers,
-    }) catch {
-        return .{ .status = "502 Bad Gateway", .content_type = "application/json", .body = resolved.backend.unreachableBody() };
-    };
-
-    const status_code: u10 = @intFromEnum(result.status);
-    const resp_body = response_body.toOwnedSlice() catch
-        return .{ .status = "500 Internal Server Error", .content_type = "application/json", .body = "{\"error\":\"internal error\"}" };
-
-    const status = mapStatus(status_code);
-
-    return .{
-        .status = status,
-        .content_type = "application/json",
-        .body = resp_body,
-    };
+    return http_proxy.forward(allocator, .{
+        .method = method,
+        .base_url = resolved.base_url,
+        .path = path,
+        .body = body,
+        .bearer_token = resolved.token,
+        .unreachable_body = resolved.backend.unreachableBody(),
+    });
 }
 
 const ForwardedTarget = struct {
@@ -205,34 +166,6 @@ fn forwardedTarget(allocator: Allocator, target: []const u8) !ForwardedTarget {
 fn isHubProxyParam(param: []const u8) bool {
     const key = if (std.mem.indexOfScalar(u8, param, '=')) |eq| param[0..eq] else param;
     return std.mem.eql(u8, key, "tickets_instance") or std.mem.eql(u8, key, "boiler_instance");
-}
-
-fn parseMethod(method: []const u8) ?std.http.Method {
-    if (std.mem.eql(u8, method, "GET")) return .GET;
-    if (std.mem.eql(u8, method, "POST")) return .POST;
-    if (std.mem.eql(u8, method, "PUT")) return .PUT;
-    if (std.mem.eql(u8, method, "DELETE")) return .DELETE;
-    if (std.mem.eql(u8, method, "PATCH")) return .PATCH;
-    return null;
-}
-
-fn mapStatus(code: u10) []const u8 {
-    return switch (code) {
-        200 => "200 OK",
-        201 => "201 Created",
-        204 => "204 No Content",
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        403 => "403 Forbidden",
-        404 => "404 Not Found",
-        405 => "405 Method Not Allowed",
-        409 => "409 Conflict",
-        422 => "422 Unprocessable Entity",
-        500 => "500 Internal Server Error",
-        502 => "502 Bad Gateway",
-        503 => "503 Service Unavailable",
-        else => if (code >= 200 and code < 300) "200 OK" else if (code >= 400 and code < 500) "400 Bad Request" else "500 Internal Server Error",
-    };
 }
 
 const TestUpstream = struct {

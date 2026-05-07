@@ -10,7 +10,7 @@
   let wizardSteps = $derived(
     (wizardData?.wizard?.steps || wizardData?.steps || []).filter((step: any) => {
       if (step.id === 'gateway_port') return false;
-      if (step.id === 'port') return componentName === 'nullboiler' || componentName === 'nulltickets';
+      if (step.id === 'port') return componentName !== 'nullclaw';
       return true;
     }),
   );
@@ -29,6 +29,7 @@
       wizardError = (e as Error).message;
     });
   });
+
 </script>
 
 <div class="wizard-page">
