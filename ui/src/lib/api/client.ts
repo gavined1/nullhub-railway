@@ -1,4 +1,5 @@
 import { createOrchestrationApi } from '$lib/api/orchestration';
+import { createNullTicketsApi } from '$lib/api/nulltickets';
 import { encodePathSegment } from '$lib/orchestration/routes';
 
 const BASE = '/api';
@@ -13,21 +14,6 @@ function withQuery(path: string, params: Record<string, string | number | boolea
   return query ? `${path}?${query}` : path;
 }
 
-function withNullTicketsQuery(
-  path: string,
-  params: Record<string, string | number | boolean | null | undefined>,
-): string {
-  const query = Object.entries(params)
-    .filter(([, value]) => value !== null && value !== undefined && value !== '')
-    .map(([key, value]) => {
-      let encodedValue = encodeURIComponent(String(value));
-      if (key === 'cursor') encodedValue = encodedValue.replace(/%3A/gi, ':');
-      return `${encodeURIComponent(key)}=${encodedValue}`;
-    })
-    .join('&');
-  return query ? `${path}?${query}` : path;
-}
-
 export { encodePathSegment };
 
 export type LogSource = 'instance' | 'nullhub';
@@ -37,13 +23,6 @@ export type ReportRepoOption = ReportOption & { repo: string };
 type InstanceStartOptions = {
   launch_mode?: string;
   verbose?: boolean;
-};
-
-type NullTicketsActionRequest = {
-  method?: 'GET' | 'POST' | 'DELETE';
-  path: string;
-  payload?: any;
-  bearer_token?: string;
 };
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -161,117 +140,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  nullTicketsAction: (c: string, n: string, payload: NullTicketsActionRequest) =>
+  ...createNullTicketsApi((c, n, payload) =>
     request<any>(`/instances/${c}/${n}/tickets`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  nullTicketsPipelines: (c: string, n: string) =>
-    api.nullTicketsAction(c, n, { method: 'GET', path: '/pipelines' }),
-  nullTicketsTasks: (
-    c: string,
-    n: string,
-    params?: { pipelineId?: string; stage?: string; limit?: number; cursor?: string },
-  ) =>
-    api.nullTicketsAction(c, n, {
-      method: 'GET',
-      path: withNullTicketsQuery('/tasks', {
-        pipeline_id: params?.pipelineId,
-        stage: params?.stage,
-        limit: params?.limit,
-        cursor: params?.cursor,
-      }),
-    }),
-  nullTicketsCreateTask: (c: string, n: string, payload: any) =>
-    api.nullTicketsAction(c, n, { method: 'POST', path: '/tasks', payload }),
-  nullTicketsBulkCreateTasks: (c: string, n: string, tasks: any[]) =>
-    api.nullTicketsAction(c, n, { method: 'POST', path: '/tasks/bulk', payload: { tasks } }),
-  nullTicketsClaimTask: (c: string, n: string, payload: any) =>
-    api.nullTicketsAction(c, n, { method: 'POST', path: '/leases/claim', payload }),
-  nullTicketsHeartbeatLease: (c: string, n: string, leaseId: string, bearerToken: string) =>
-    api.nullTicketsAction(c, n, {
-      method: 'POST',
-      path: `/leases/${encodePathSegment(leaseId)}/heartbeat`,
-      bearer_token: bearerToken,
-    }),
-  nullTicketsCreatePipeline: (c: string, n: string, payload: any) =>
-    api.nullTicketsAction(c, n, { method: 'POST', path: '/pipelines', payload }),
-  nullTicketsGetPipeline: (c: string, n: string, pipelineId: string) =>
-    api.nullTicketsAction(c, n, { method: 'GET', path: `/pipelines/${encodePathSegment(pipelineId)}` }),
-  nullTicketsGetTask: (c: string, n: string, taskId: string) =>
-    api.nullTicketsAction(c, n, { method: 'GET', path: `/tasks/${encodePathSegment(taskId)}` }),
-  nullTicketsAssignTask: (c: string, n: string, taskId: string, payload: any) =>
-    api.nullTicketsAction(c, n, {
-      method: 'POST',
-      path: `/tasks/${encodePathSegment(taskId)}/assignments`,
-      payload,
-    }),
-  nullTicketsUnassignTask: (c: string, n: string, taskId: string, agentId: string) =>
-    api.nullTicketsAction(c, n, {
-      method: 'DELETE',
-      path: `/tasks/${encodePathSegment(taskId)}/assignments/${encodePathSegment(agentId)}`,
-    }),
-  nullTicketsAddDependency: (c: string, n: string, taskId: string, payload: any) =>
-    api.nullTicketsAction(c, n, {
-      method: 'POST',
-      path: `/tasks/${encodePathSegment(taskId)}/dependencies`,
-      payload,
-    }),
-  nullTicketsGetRunState: (c: string, n: string, taskId: string) =>
-    api.nullTicketsAction(c, n, {
-      method: 'GET',
-      path: `/tasks/${encodePathSegment(taskId)}/run-state`,
-    }),
-  nullTicketsRunEvents: (
-    c: string,
-    n: string,
-    runId: string,
-    params?: { limit?: number; cursor?: string },
-  ) =>
-    api.nullTicketsAction(c, n, {
-      method: 'GET',
-      path: withNullTicketsQuery(`/runs/${encodePathSegment(runId)}/events`, {
-        limit: params?.limit,
-        cursor: params?.cursor,
-      }),
-    }),
-  nullTicketsAddRunEvent: (c: string, n: string, runId: string, payload: any, bearerToken: string) =>
-    api.nullTicketsAction(c, n, {
-      method: 'POST',
-      path: `/runs/${encodePathSegment(runId)}/events`,
-      payload,
-      bearer_token: bearerToken,
-    }),
-  nullTicketsTransitionRun: (c: string, n: string, runId: string, payload: any, bearerToken: string) =>
-    api.nullTicketsAction(c, n, {
-      method: 'POST',
-      path: `/runs/${encodePathSegment(runId)}/transition`,
-      payload,
-      bearer_token: bearerToken,
-    }),
-  nullTicketsFailRun: (c: string, n: string, runId: string, payload: any, bearerToken: string) =>
-    api.nullTicketsAction(c, n, {
-      method: 'POST',
-      path: `/runs/${encodePathSegment(runId)}/fail`,
-      payload,
-      bearer_token: bearerToken,
-    }),
-  nullTicketsArtifacts: (
-    c: string,
-    n: string,
-    params?: { taskId?: string; runId?: string; limit?: number; cursor?: string },
-  ) =>
-    api.nullTicketsAction(c, n, {
-      method: 'GET',
-      path: withNullTicketsQuery('/artifacts', {
-        task_id: params?.taskId,
-        run_id: params?.runId,
-        limit: params?.limit,
-        cursor: params?.cursor,
-      }),
-    }),
-  nullTicketsCreateArtifact: (c: string, n: string, payload: any) =>
-    api.nullTicketsAction(c, n, { method: 'POST', path: '/artifacts', payload }),
+  ),
   putConfig: (c: string, n: string, config: any) =>
     request<any>(`/instances/${c}/${n}/config`, { method: 'PUT', body: JSON.stringify(config) }),
   getLogs: (c: string, n: string, lines = 100, source: LogSource = 'instance') =>

@@ -8,7 +8,26 @@ type WithQueryFn = (
 ) => string;
 type QueryParams = Record<string, string | number | boolean | null | undefined>;
 type BoilerOptions = { boilerInstance?: string };
-type RunListParams = { status?: string; workflow_id?: string; boilerInstance?: string };
+type RunListParams = {
+  status?: string;
+  workflow_id?: string;
+  limit?: number;
+  offset?: number;
+  boilerInstance?: string;
+};
+
+export type RunListPage = {
+  items: any[];
+  limit?: number;
+  offset?: number;
+  nextOffset?: number;
+  hasMore: boolean;
+};
+
+export type RunStreamHandle = {
+  close: () => void;
+  readonly closed: boolean;
+};
 
 const orchestrationStorePrefix = '/orchestration/store';
 
@@ -61,6 +80,21 @@ function normalizeRun(raw: any): any {
   };
 }
 
+function normalizeRunListPage(raw: any): RunListPage {
+  const list = Array.isArray(raw) ? raw : raw?.items ?? raw?.runs ?? [];
+  return {
+    items: (list || []).map(normalizeRun),
+    limit: typeof raw?.limit === 'number' ? raw.limit : undefined,
+    offset: typeof raw?.offset === 'number' ? raw.offset : undefined,
+    nextOffset: typeof raw?.next_offset === 'number'
+      ? raw.next_offset
+      : typeof raw?.nextOffset === 'number'
+        ? raw.nextOffset
+        : undefined,
+    hasMore: Boolean(raw?.has_more ?? raw?.hasMore),
+  };
+}
+
 function normalizeCheckpoint(raw: any): any {
   if (!raw) return raw;
   return {
@@ -110,6 +144,12 @@ export function createOrchestrationApi(request: RequestFn, withQuery: WithQueryF
     return withQuery(path, { ...params, boiler_instance: selectedBoiler || undefined });
   }
 
+  async function listRunsPage(params?: RunListParams): Promise<RunListPage> {
+    const { boilerInstance, ...query } = params ?? {};
+    const raw = await request<any>(withBoilerQuery(orchestrationApiPaths.runs(), query, boilerInstance));
+    return normalizeRunListPage(raw);
+  }
+
   return {
     listWorkflows: async (options?: BoilerOptions) => {
       const raw = await request<any>(withBoilerQuery(orchestrationApiPaths.workflows(), {}, options?.boilerInstance));
@@ -128,12 +168,8 @@ export function createOrchestrationApi(request: RequestFn, withQuery: WithQueryF
       normalizeValidation(await request<any>(withBoilerQuery(orchestrationApiPaths.workflowValidate(id), {}, options?.boilerInstance), { method: 'POST' })),
     runWorkflow: (id: string, input: any, options?: BoilerOptions) =>
       request<any>(withBoilerQuery(orchestrationApiPaths.workflowRun(id), {}, options?.boilerInstance), { method: 'POST', body: JSON.stringify(input) }),
-    listRuns: async (params?: RunListParams) => {
-      const { boilerInstance, ...query } = params ?? {};
-      const raw = await request<any>(withBoilerQuery(orchestrationApiPaths.runs(), query, boilerInstance));
-      const list = Array.isArray(raw) ? raw : raw?.items ?? [];
-      return list.map(normalizeRun);
-    },
+    listRunsPage,
+    listRuns: async (params?: RunListParams) => (await listRunsPage(params)).items,
     getRun: async (id: string, options?: BoilerOptions) =>
       normalizeRun(await request<any>(withBoilerQuery(orchestrationApiPaths.run(id), {}, options?.boilerInstance))),
     cancelRun: (id: string, options?: BoilerOptions) =>
@@ -182,6 +218,7 @@ export function createOrchestrationApi(request: RequestFn, withQuery: WithQueryF
       options?: BoilerOptions,
     ) => {
       let active = true;
+      let closed = false;
       let deliveredInitialSnapshot = false;
       let afterSeq = 0;
 
@@ -208,6 +245,7 @@ export function createOrchestrationApi(request: RequestFn, withQuery: WithQueryF
               afterSeq = Math.max(afterSeq, res.next_stream_seq);
             }
             if (res?.status && ['completed', 'failed', 'cancelled'].includes(res.status)) {
+              active = false;
               break;
             }
           } catch {
@@ -217,10 +255,19 @@ export function createOrchestrationApi(request: RequestFn, withQuery: WithQueryF
           if (!active) break;
           await new Promise(r => setTimeout(r, 1000));
         }
+        closed = true;
       };
 
       void poll();
-      return { close: () => { active = false; } } as EventSource;
+      return {
+        close: () => {
+          active = false;
+          closed = true;
+        },
+        get closed() {
+          return closed;
+        },
+      };
     },
   };
 }

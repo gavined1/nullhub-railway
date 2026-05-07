@@ -6,6 +6,7 @@
   import StateInspector from "$lib/components/orchestration/StateInspector.svelte";
   import RunEventLog from "$lib/components/orchestration/RunEventLog.svelte";
   import CheckpointTimeline from "$lib/components/orchestration/CheckpointTimeline.svelte";
+  import type { RunStreamHandle } from "$lib/api/orchestration";
 
   type Workflow = {
     id?: string;
@@ -66,6 +67,12 @@
     created_at_ms?: number;
   };
 
+  type LoadRunsOptions = {
+    keepSelection?: boolean;
+    append?: boolean;
+    refreshDetail?: boolean;
+  };
+
   let { component, name, active = false, running = false } = $props<{
     component: string;
     name: string;
@@ -102,6 +109,10 @@
   let runs = $state<Run[]>([]);
   let runStatusFilter = $state("");
   let runWorkflowFilter = $state("");
+  let runLimit = $state("50");
+  let runsHasMore = $state(false);
+  let runsNextOffset = $state<number | null>(null);
+  let runsQueryKey = $state("");
   let selectedRunId = $state("");
   let selectedRun = $state<Run | null>(null);
   let selectedRunWorkflow = $state<any>({ nodes: {}, edges: [] });
@@ -117,7 +128,8 @@
   let selectedCheckpointState = $state<any>(null);
   let checkpointOverrides = $state("{}");
   let checkpointOverridesValid = $state(true);
-  let runStream: EventSource | null = null;
+  let runStream: RunStreamHandle | null = null;
+  let runDetailRequestSeq = 0;
 
   let trackerStatus = $state<any>(null);
   let trackerStats = $state<any>(null);
@@ -229,6 +241,30 @@
     return JSON.parse(trimmed);
   }
 
+  function boundedInt(raw: string, fallback: number, min: number, max: number): number {
+    const value = Number.parseInt(raw || String(fallback), 10);
+    if (!Number.isFinite(value)) return fallback;
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function runFiltersKey(): string {
+    return JSON.stringify({
+      status: runStatusFilter || "",
+      workflow: runWorkflowFilter || "",
+      limit: boundedInt(runLimit, 50, 1, 250),
+    });
+  }
+
+  function runQueryParams(offset = 0) {
+    return {
+      boilerInstance: name,
+      status: runStatusFilter || undefined,
+      workflow_id: runWorkflowFilter || undefined,
+      limit: boundedInt(runLimit, 50, 1, 250),
+      offset,
+    };
+  }
+
   function editableWorkflowPayload(workflow: any): any {
     const source =
       workflow?.definition && typeof workflow.definition === "object" && !Array.isArray(workflow.definition)
@@ -284,6 +320,7 @@
   }
 
   function resetRunDetail() {
+    runDetailRequestSeq += 1;
     closeRunStream();
     selectedRunId = "";
     selectedRun = null;
@@ -306,10 +343,12 @@
 
   function connectRunStream(id: string) {
     if (!id || component !== "nullboiler" || !running) return;
-    if (streamRunId === id && runStream) return;
+    const sameRun = streamRunId === id;
+    if (sameRun && runStream && !runStream.closed) return;
+    const resetEvents = !sameRun || Boolean(runStream?.closed);
     closeRunStream();
     streamRunId = id;
-    runEvents = [];
+    if (resetEvents) runEvents = [];
     try {
       runStream = api.streamRun(
         id,
@@ -344,7 +383,12 @@
     loading = true;
     error = "";
     try {
-      await Promise.all([loadWorkflows(), loadRuns(true), loadTracker(), loadWorkers()]);
+      await Promise.all([
+        loadWorkflows(),
+        loadRuns({ keepSelection: true, refreshDetail: true }),
+        loadTracker(),
+        loadWorkers(),
+      ]);
     } finally {
       loading = false;
     }
@@ -448,7 +492,7 @@
       validationResult = null;
       setWorkflowJson(JSON.stringify(emptyWorkflow(), null, 2));
       await loadWorkflows();
-      await loadRuns(false);
+      await loadRuns({ keepSelection: false });
       panelView = "workflows";
     } catch (e) {
       error = (e as Error).message;
@@ -473,20 +517,21 @@
     }
   }
 
-  async function runWorkflow() {
-    if (!selectedWorkflowId || workflowEditorMode === "create" || component !== "nullboiler" || !running) return;
+  async function startWorkflowRun(workflowIdValue: string, inputRaw = workflowInput) {
+    const id = workflowIdValue.trim();
+    if (!id || component !== "nullboiler" || !running) return;
     actionLoading = true;
     error = "";
     message = "";
     try {
-      const input = parseJsonField(workflowInput, {});
-      const result = await api.runWorkflow(selectedWorkflowId, { input }, boilerOptions());
-      const id = String(result?.id || "");
-      message = `Run ${id || ""} started`.trim();
-      await loadRuns(false);
-      if (id) {
+      const input = parseJsonField(inputRaw, {});
+      const result = await api.runWorkflow(id, { input }, boilerOptions());
+      const runIdValue = String(result?.id || "");
+      message = `Run ${runIdValue || ""} started`.trim();
+      await loadRuns({ keepSelection: false });
+      if (runIdValue) {
         panelView = "runs";
-        await loadRunDetail(id, true);
+        await loadRunDetail(runIdValue, true);
       }
     } catch (e) {
       error = (e as Error).message;
@@ -495,25 +540,40 @@
     }
   }
 
-  async function loadRuns(keepSelection = true) {
+  async function runWorkflow() {
+    if (!selectedWorkflowId || workflowEditorMode === "create") return;
+    await startWorkflowRun(selectedWorkflowId, workflowInput);
+  }
+
+  async function loadRuns(options: LoadRunsOptions = {}) {
     if (component !== "nullboiler" || !running) return;
+    const keepSelection = options.keepSelection ?? true;
+    const append = options.append ?? false;
+    const refreshDetail = options.refreshDetail ?? !append;
     try {
-      runs =
-        (await api.listRuns({
-          boilerInstance: name,
-          status: runStatusFilter || undefined,
-          workflow_id: runWorkflowFilter || undefined,
-        })) || [];
+      const queryKey = runFiltersKey();
+      const canAppend = append && runsQueryKey === queryKey && runsNextOffset !== null;
+      const page = await api.listRunsPage(runQueryParams(canAppend ? runsNextOffset || 0 : 0));
+      const nextItems = page?.items || [];
+      if (canAppend) {
+        const seen = new Set(runs.map(runId));
+        runs = [...runs, ...nextItems.filter((run) => !seen.has(runId(run)))];
+      } else {
+        runs = nextItems;
+      }
+      runsQueryKey = queryKey;
+      runsHasMore = Boolean(page?.hasMore && typeof page?.nextOffset === "number");
+      runsNextOffset = runsHasMore ? page.nextOffset || 0 : null;
+
       const selectedStillVisible = selectedRunId && runs.some((run) => runId(run) === selectedRunId);
       if (keepSelection && selectedStillVisible) {
+        if (refreshDetail) await loadRunDetail(selectedRunId, false);
         return;
       }
       if (runs.length > 0) {
-        const nextRunId = keepSelection && selectedStillVisible ? selectedRunId : runId(runs[0]);
-        if (nextRunId && (!selectedRun || nextRunId !== selectedRunId || !keepSelection)) {
-          await loadRunDetail(nextRunId, false);
-        }
-      } else if (!keepSelection) {
+        const nextRunId = runId(runs[0]);
+        if (nextRunId) await loadRunDetail(nextRunId, false);
+      } else if (!append || !keepSelection) {
         resetRunDetail();
       }
     } catch (e) {
@@ -521,14 +581,21 @@
     }
   }
 
+  async function loadMoreRuns() {
+    if (!runsHasMore || runsNextOffset === null) return;
+    await loadRuns({ keepSelection: true, append: true, refreshDetail: false });
+  }
+
   async function loadRunDetail(id: string, openRuns = true) {
     if (!id || component !== "nullboiler" || !running) return;
+    const requestSeq = ++runDetailRequestSeq;
     detailLoading = true;
     error = "";
     try {
       const sameRun = selectedRunId === id;
       const previous = sameRun ? selectedRun?.state || null : null;
       const data = await api.getRun(id, boilerOptions());
+      if (requestSeq !== runDetailRequestSeq) return;
       selectedRunId = id;
       previousRunState = previous;
       selectedRun = data;
@@ -544,13 +611,14 @@
       } else {
         selectedRunWorkflow = { nodes: {}, edges: [] };
       }
-      await loadCheckpoints(id);
+      await loadCheckpoints(id, requestSeq);
+      if (requestSeq !== runDetailRequestSeq) return;
       connectRunStream(id);
       if (openRuns) panelView = "runs";
     } catch (e) {
-      error = (e as Error).message;
+      if (requestSeq === runDetailRequestSeq) error = (e as Error).message;
     } finally {
-      detailLoading = false;
+      if (requestSeq === runDetailRequestSeq) detailLoading = false;
     }
   }
 
@@ -563,7 +631,7 @@
       await api.cancelRun(selectedRunId, boilerOptions());
       message = "Run cancelled";
       await loadRunDetail(selectedRunId, false);
-      await loadRuns(true);
+      await loadRuns({ keepSelection: true, refreshDetail: false });
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -580,7 +648,7 @@
       const result = await api.retryRun(selectedRunId, boilerOptions());
       message = `Retry ${result?.id || selectedRunId} started`;
       await loadRunDetail(String(result?.id || selectedRunId), false);
-      await loadRuns(true);
+      await loadRuns({ keepSelection: true, refreshDetail: false });
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -599,7 +667,7 @@
       message = "Run resumed";
       resumeUpdates = "{}";
       await loadRunDetail(selectedRunId, false);
-      await loadRuns(true);
+      await loadRuns({ keepSelection: true, refreshDetail: false });
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -631,31 +699,44 @@
     }
   }
 
-  async function loadCheckpoints(runIdValue = selectedRunId) {
+  function isCurrentRunRequest(runIdValue: string, requestSeq?: number): boolean {
+    return selectedRunId === runIdValue && (requestSeq === undefined || requestSeq === runDetailRequestSeq);
+  }
+
+  async function loadCheckpoints(runIdValue = selectedRunId, requestSeq?: number) {
     if (!runIdValue || component !== "nullboiler" || !running) return;
+    if (requestSeq !== undefined && requestSeq !== runDetailRequestSeq) return;
     checkpoints = [];
     selectedCheckpointId = "";
     selectedCheckpointState = null;
     try {
-      checkpoints = (await api.listCheckpoints(runIdValue, boilerOptions())) || [];
-      if (checkpoints.length > 0) {
-        await selectCheckpoint(String(checkpoints[checkpoints.length - 1]?.id || ""));
+      const nextCheckpoints = (await api.listCheckpoints(runIdValue, boilerOptions())) || [];
+      if (!isCurrentRunRequest(runIdValue, requestSeq)) return;
+      checkpoints = nextCheckpoints;
+      const latestCheckpointId = String(nextCheckpoints[nextCheckpoints.length - 1]?.id || "");
+      if (latestCheckpointId) {
+        await selectCheckpoint(latestCheckpointId, runIdValue, requestSeq);
       }
     } catch {
+      if (!isCurrentRunRequest(runIdValue, requestSeq)) return;
       checkpoints = [];
       selectedCheckpointId = "";
       selectedCheckpointState = null;
     }
   }
 
-  async function selectCheckpoint(id: string) {
-    if (!id || !selectedRunId || component !== "nullboiler" || !running) return;
+  async function selectCheckpoint(id: string, runIdValue = selectedRunId, requestSeq?: number) {
+    if (!id || !runIdValue || component !== "nullboiler" || !running) return;
+    if (!isCurrentRunRequest(runIdValue, requestSeq)) return;
     selectedCheckpointId = id;
     try {
-      const checkpoint = await api.getCheckpoint(selectedRunId, id, boilerOptions());
+      const checkpoint = await api.getCheckpoint(runIdValue, id, boilerOptions());
+      if (!isCurrentRunRequest(runIdValue, requestSeq) || selectedCheckpointId !== id) return;
       selectedCheckpointState = checkpoint?.state || checkpoint;
     } catch (e) {
-      error = (e as Error).message;
+      if (isCurrentRunRequest(runIdValue, requestSeq) && selectedCheckpointId === id) {
+        error = (e as Error).message;
+      }
     }
   }
 
@@ -673,7 +754,7 @@
       );
       const id = String(result?.id || "");
       message = `Fork ${id || ""} started`.trim();
-      await loadRuns(false);
+      await loadRuns({ keepSelection: false });
       if (id) await loadRunDetail(id, true);
     } catch (e) {
       error = (e as Error).message;
@@ -691,7 +772,7 @@
       await api.replayRun(selectedRunId, selectedCheckpointId, boilerOptions());
       message = "Run replay started";
       await loadRunDetail(selectedRunId, false);
-      await loadRuns(true);
+      await loadRuns({ keepSelection: true, refreshDetail: false });
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -720,14 +801,13 @@
     error = "";
     message = "";
     try {
-      const maxConcurrent = Number.parseInt(workerMaxConcurrentValue || "1", 10);
       const payload: Record<string, any> = {
         id: workerIdValue.trim(),
         url: workerUrlValue.trim(),
         protocol: workerProtocolValue.trim() || "webhook",
         token: workerTokenValue,
         tags: parseJsonField(workerTagsValue, []),
-        max_concurrent: Number.isFinite(maxConcurrent) ? Math.max(1, maxConcurrent) : 1,
+        max_concurrent: boundedInt(workerMaxConcurrentValue, 1, 1, 1_000_000),
       };
       if (workerModelValue.trim()) payload.model = workerModelValue.trim();
       const result = await api.registerWorker(payload, boilerOptions());
@@ -938,7 +1018,11 @@
                 <button class="btn" onclick={() => loadWorkflowForEdit(workflowId(selectedWorkflow))}>
                   Edit JSON
                 </button>
-                <button class="btn run" onclick={() => { void loadWorkflowForEdit(workflowId(selectedWorkflow)); }}>
+                <button
+                  class="btn run"
+                  onclick={() => startWorkflowRun(workflowId(selectedWorkflow), "{}")}
+                  disabled={actionLoading}
+                >
                   Run
                 </button>
               </div>
@@ -1051,7 +1135,11 @@
                 {/each}
               </select>
             </label>
-            <button class="btn" onclick={() => loadRuns(false)} disabled={loading}>Apply</button>
+            <label class="field">
+              <span>Limit</span>
+              <input bind:value={runLimit} inputmode="numeric" />
+            </label>
+            <button class="btn" onclick={() => loadRuns({ keepSelection: false })} disabled={loading}>Apply</button>
           </div>
           <div class="run-counts">
             <span>running {runCounts.running || 0}</span>
@@ -1075,6 +1163,11 @@
               {/each}
             {/if}
           </div>
+          {#if runsHasMore}
+            <button class="btn subtle" onclick={loadMoreRuns} disabled={loading || detailLoading}>
+              Load More
+            </button>
+          {/if}
         </section>
 
         <section class="boiler-section run-detail">

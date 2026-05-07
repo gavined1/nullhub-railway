@@ -8,6 +8,7 @@
   import RunEventLog from '$lib/components/orchestration/RunEventLog.svelte';
   import InterruptPanel from '$lib/components/orchestration/InterruptPanel.svelte';
   import BoilerInstanceSelector from '$lib/components/orchestration/BoilerInstanceSelector.svelte';
+  import type { RunStreamHandle } from '$lib/api/orchestration';
 
   let id = $derived($page.params.id);
 
@@ -18,7 +19,7 @@
   let error = $state<string | null>(null);
   let nodeStatus = $state<Record<string, string>>({});
   let previousState = $state<any>(null);
-  let eventSource: EventSource | null = null;
+  let runStream: RunStreamHandle | null = null;
   let pollInterval: ReturnType<typeof setInterval>;
 
   async function loadRun() {
@@ -50,9 +51,9 @@
   }
 
   function connectStream() {
-    eventSource?.close();
+    runStream?.close();
     try {
-      eventSource = api.streamRun(id, (event) => {
+      runStream = api.streamRun(id, (event) => {
         events = [...events, { ...event, timestamp: event.timestamp ?? Date.now() / 1000 }];
         // On significant events, refresh run data
         if (['step_completed', 'step_failed', 'run_completed', 'run_failed', 'interrupted', 'state_update', 'values', 'updates', 'task_result'].includes(event.type)) {
@@ -60,7 +61,7 @@
         }
       });
     } catch {
-      // SSE not available, rely on polling
+      runStream = null;
     }
   }
 
@@ -84,7 +85,7 @@
 
   onDestroy(() => {
     clearInterval(pollInterval);
-    eventSource?.close();
+    runStream?.close();
   });
 
   let isInterrupted = $derived(run?.status === 'interrupted');

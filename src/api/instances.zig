@@ -163,26 +163,21 @@ fn isLeaseHeartbeatTarget(path: []const u8) bool {
     return lease_id.len > 0 and std.mem.indexOfScalar(u8, lease_id, '/') == null;
 }
 
-fn isLeaseScopedNullTicketsAction(method: std.http.Method, path: []const u8) bool {
-    if (method != .POST) return false;
-    const clean = stripQuery(path);
-    if (path.len != clean.len) return false;
-    return isLeaseHeartbeatTarget(clean) or
-        isRunSubpath(clean, "/events") or
-        isRunSubpath(clean, "/transition") or
-        isRunSubpath(clean, "/fail");
-}
+const NullTicketsActionAuthMode = enum {
+    instance_token,
+    lease_token,
+};
 
-fn isAllowedNullTicketsAction(method: std.http.Method, path: []const u8) bool {
-    if (path.len == 0 or path.len > 2048) return false;
-    if (path[0] != '/') return false;
-    if (std.mem.startsWith(u8, path, "//")) return false;
-    if (std.mem.indexOfScalar(u8, path, '#') != null) return false;
-    if (hasUnsafeActionPathByte(path)) return false;
+fn classifyNullTicketsAction(method: std.http.Method, path: []const u8) ?NullTicketsActionAuthMode {
+    if (path.len == 0 or path.len > 2048) return null;
+    if (path[0] != '/') return null;
+    if (std.mem.startsWith(u8, path, "//")) return null;
+    if (std.mem.indexOfScalar(u8, path, '#') != null) return null;
+    if (hasUnsafeActionPathByte(path)) return null;
 
     const clean = stripQuery(path);
     return switch (method) {
-        .GET => std.mem.eql(u8, clean, "/pipelines") or
+        .GET => if (std.mem.eql(u8, clean, "/pipelines") or
             hasSinglePathTail(clean, "/pipelines/") or
             std.mem.eql(u8, clean, "/tasks") or
             hasSinglePathTail(clean, "/tasks/") or
@@ -191,21 +186,48 @@ fn isAllowedNullTicketsAction(method: std.http.Method, path: []const u8) bool {
             isTaskSubpath(clean, "/assignments") or
             isRunSubpath(clean, "/events") or
             std.mem.eql(u8, clean, "/artifacts") or
-            std.mem.eql(u8, clean, "/ops/queue"),
-        .POST => path.len == clean.len and
-            (std.mem.eql(u8, clean, "/pipelines") or
+            std.mem.eql(u8, clean, "/ops/queue")) .instance_token else null,
+        .POST => blk: {
+            if (path.len != clean.len) break :blk null;
+            if (isLeaseHeartbeatTarget(clean) or
+                isRunSubpath(clean, "/events") or
+                isRunSubpath(clean, "/transition") or
+                isRunSubpath(clean, "/fail"))
+            {
+                break :blk .lease_token;
+            }
+            if (std.mem.eql(u8, clean, "/pipelines") or
                 std.mem.eql(u8, clean, "/tasks") or
                 std.mem.eql(u8, clean, "/tasks/bulk") or
                 isTaskSubpath(clean, "/dependencies") or
                 isTaskSubpath(clean, "/assignments") or
                 std.mem.eql(u8, clean, "/leases/claim") or
-                isLeaseHeartbeatTarget(clean) or
-                isRunSubpath(clean, "/events") or
-                isRunSubpath(clean, "/transition") or
-                isRunSubpath(clean, "/fail") or
-                std.mem.eql(u8, clean, "/artifacts")),
-        .DELETE => path.len == clean.len and isTaskAssignmentTarget(clean),
-        else => false,
+                std.mem.eql(u8, clean, "/artifacts"))
+            {
+                break :blk .instance_token;
+            }
+            break :blk null;
+        },
+        .DELETE => if (path.len == clean.len and isTaskAssignmentTarget(clean)) .instance_token else null,
+        else => null,
+    };
+}
+
+fn isAllowedNullTicketsAction(method: std.http.Method, path: []const u8) bool {
+    return classifyNullTicketsAction(method, path) != null;
+}
+
+fn nullTicketsForwardedToken(
+    auth_mode: NullTicketsActionAuthMode,
+    instance_token: ?[]const u8,
+    request_bearer_token: ?[]const u8,
+) ?[]const u8 {
+    return switch (auth_mode) {
+        .instance_token => instance_token,
+        .lease_token => blk: {
+            const token = request_bearer_token orelse break :blk null;
+            break :blk if (token.len > 0) token else null;
+        },
     };
 }
 
@@ -232,9 +254,9 @@ fn handleNullTicketsAction(
     const method_name = parsed.value.method orelse "GET";
     const http_method = parseNullTicketsActionMethod(method_name) orelse
         return methodNotAllowed();
-    if (!isAllowedNullTicketsAction(http_method, parsed.value.path)) {
+    const auth_mode = classifyNullTicketsAction(http_method, parsed.value.path) orelse {
         return badRequest("{\"error\":\"unsupported nulltickets action\"}");
-    }
+    };
 
     var tickets_cfg = blk: {
         mutex.lock();
@@ -264,13 +286,7 @@ fn handleNullTicketsAction(
     defer if (auth_header) |value| allocator.free(value);
     var header_buf: [2]std.http.Header = undefined;
     var header_count: usize = 0;
-    const lease_scoped = isLeaseScopedNullTicketsAction(http_method, parsed.value.path);
-    const request_bearer_token = if (lease_scoped) parsed.value.bearer_token else null;
-    const forwarded_token: ?[]const u8 = blk: {
-        if (!lease_scoped) break :blk tickets_cfg.api_token;
-        const token = request_bearer_token orelse break :blk null;
-        break :blk if (token.len > 0) token else null;
-    };
+    const forwarded_token = nullTicketsForwardedToken(auth_mode, tickets_cfg.api_token, parsed.value.bearer_token);
     if (forwarded_token) |token| {
         auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{token}) catch return helpers.serverError();
         header_buf[header_count] = .{ .name = "Authorization", .value = auth_header.? };
@@ -4414,6 +4430,28 @@ test "isAllowedNullTicketsAction allows only safe tracker actions" {
     try std.testing.expect(!isAllowedNullTicketsAction(.POST, "/tasks?limit=1"));
     try std.testing.expect(!isAllowedNullTicketsAction(.POST, "/runs/run-a/events?limit=1"));
     try std.testing.expect(!isAllowedNullTicketsAction(.POST, "/leases/lease-a/heartbeat?ttl=1"));
+}
+
+test "classifyNullTicketsAction separates instance and lease scoped auth" {
+    try std.testing.expectEqual(NullTicketsActionAuthMode.instance_token, classifyNullTicketsAction(.GET, "/tasks?limit=8").?);
+    try std.testing.expectEqual(NullTicketsActionAuthMode.instance_token, classifyNullTicketsAction(.POST, "/leases/claim").?);
+    try std.testing.expectEqual(NullTicketsActionAuthMode.lease_token, classifyNullTicketsAction(.POST, "/leases/lease-a/heartbeat").?);
+    try std.testing.expectEqual(NullTicketsActionAuthMode.lease_token, classifyNullTicketsAction(.POST, "/runs/run-a/events").?);
+    try std.testing.expect(classifyNullTicketsAction(.POST, "/runs/run-a/events?limit=1") == null);
+    try std.testing.expect(classifyNullTicketsAction(.POST, "/store/default/key") == null);
+}
+
+test "nullTicketsForwardedToken does not mix admin and lease credentials" {
+    try std.testing.expectEqualStrings(
+        "admin-token",
+        nullTicketsForwardedToken(.instance_token, "admin-token", "lease-token").?,
+    );
+    try std.testing.expectEqualStrings(
+        "lease-token",
+        nullTicketsForwardedToken(.lease_token, "admin-token", "lease-token").?,
+    );
+    try std.testing.expect(nullTicketsForwardedToken(.lease_token, "admin-token", null) == null);
+    try std.testing.expect(nullTicketsForwardedToken(.lease_token, "admin-token", "") == null);
 }
 
 test "actionStatus preserves expired lease status" {

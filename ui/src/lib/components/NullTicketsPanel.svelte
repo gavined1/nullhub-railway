@@ -153,7 +153,11 @@
 
   let artifacts = $state<Artifact[]>([]);
   let artifactsCursor = $state<string | null>(null);
+  let artifactsScopeKey = $state("");
   let artifactLimit = $state("25");
+  let artifactScope = $state<"selected" | "custom" | "all">("selected");
+  let artifactTaskFilter = $state("");
+  let artifactRunFilter = $state("");
   let artifactKind = $state("file");
   let artifactUri = $state("");
   let artifactSha256 = $state("");
@@ -245,6 +249,12 @@
     return JSON.parse(trimmed);
   }
 
+  function boundedInt(raw: string, fallback: number, min: number, max: number): number {
+    const parsed = Number.parseInt(raw || String(fallback), 10);
+    const value = Number.isFinite(parsed) ? parsed : fallback;
+    return Math.max(min, Math.min(max, value));
+  }
+
   function firstClaimableRole(): string {
     const role =
       queueRoles.find((item) => Number(item?.claimable_count || 0) > 0)?.role ||
@@ -262,6 +272,45 @@
       leaseRunId = "";
       heartbeatExpiresAt = null;
     }
+  }
+
+  function artifactScopeParams(): { taskId?: string; runId?: string } {
+    if (artifactScope === "all") return {};
+    if (artifactScope === "custom") {
+      return {
+        taskId: artifactTaskFilter.trim() || undefined,
+        runId: artifactRunFilter.trim() || undefined,
+      };
+    }
+    return {
+      taskId: selectedTaskId || undefined,
+      runId: selectedRunId || undefined,
+    };
+  }
+
+  function artifactScopeLabel(): string {
+    const scope = artifactScopeParams();
+    if (scope.taskId && scope.runId) return `task ${scope.taskId} / run ${scope.runId}`;
+    if (scope.taskId) return `task ${scope.taskId}`;
+    if (scope.runId) return `run ${scope.runId}`;
+    return "unlinked";
+  }
+
+  function artifactScopeCacheKey(scope: { taskId?: string; runId?: string }): string {
+    return `${artifactScope}:${scope.taskId || ""}:${scope.runId || ""}`;
+  }
+
+  function setArtifactScope(scope: "selected" | "custom" | "all") {
+    artifactScope = scope;
+    artifactsCursor = null;
+    artifactsScopeKey = "";
+    void loadArtifacts(false);
+  }
+
+  function openSelectedArtifacts() {
+    artifactScope = "selected";
+    panelView = "artifacts";
+    void loadArtifacts(false);
   }
 
   function syncLeaseToSelectedRun() {
@@ -298,7 +347,7 @@
 
   async function loadTasks(append: boolean) {
     if (component !== "nulltickets" || !running) return;
-    const limit = Math.max(1, Math.min(1000, Number.parseInt(taskLimit || "25", 10) || 25));
+    const limit = boundedInt(taskLimit, 25, 1, 1000);
     loading = true;
     error = "";
     try {
@@ -311,13 +360,6 @@
       const items = normalizeList(result);
       tasks = append ? [...tasks, ...items] : items;
       nextCursor = typeof result?.next_cursor === "string" ? result.next_cursor : null;
-      if (!append && selectedTaskId && !tasks.some((task) => taskId(task) === selectedTaskId)) {
-        selectedTaskId = "";
-        selectedTask = null;
-        clearRunContext();
-        artifacts = [];
-        artifactsCursor = null;
-      }
       if (!selectedTaskId && items.length > 0) {
         await selectTask(taskId(items[0]));
       } else if (!append && selectedTaskId) {
@@ -351,6 +393,8 @@
       selectedRunId = "";
       runEvents = [];
       artifacts = [];
+      artifactsCursor = null;
+      artifactsScopeKey = "";
       syncLeaseToSelectedRun();
       return;
     }
@@ -525,8 +569,9 @@
     actionLoading = true;
     error = "";
     message = "";
+    let claimedTaskId = "";
     try {
-      const leaseTtl = Math.max(1000, Number.parseInt(claimTtl || "300000", 10) || 300000);
+      const leaseTtl = boundedInt(claimTtl, 300000, 1000, Number.MAX_SAFE_INTEGER);
       const result = await api.nullTicketsClaimTask(component, name, {
         agent_id: claimAgent.trim() || "nullhub",
         agent_role: claimRole.trim() || "coder",
@@ -534,19 +579,21 @@
       });
       if (result?.task) {
         claimed = result;
+        claimedTaskId = String(result.task.id || "");
+        if (claimedTaskId) selectedTaskId = claimedTaskId;
+        selectedTask = result.task;
         runLeaseId = String(result.lease_id || "");
         runLeaseToken = String(result.lease_token || "");
         leaseRunId = String(result.run?.id || "");
         heartbeatExpiresAt = typeof result.expires_at_ms === "number" ? result.expires_at_ms : null;
         selectedRunId = leaseRunId;
         message = `Claimed ${result.task.id || "task"}`;
-        await loadTasks(false);
-        await selectTask(result.task.id);
       } else {
         claimed = null;
         message = "No claimable task";
       }
       await refreshAll();
+      if (claimedTaskId) await selectTask(claimedTaskId);
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -572,7 +619,7 @@
 
   async function loadRunEvents(append: boolean) {
     if (!selectedRunId || component !== "nulltickets" || !running) return;
-    const limit = Math.max(1, Math.min(1000, Number.parseInt(runEventsLimit || "50", 10) || 50));
+    const limit = boundedInt(runEventsLimit, 50, 1, 1000);
     loading = true;
     error = "";
     try {
@@ -672,19 +719,22 @@
 
   async function loadArtifacts(append: boolean) {
     if (component !== "nulltickets" || !running) return;
-    const limit = Math.max(1, Math.min(1000, Number.parseInt(artifactLimit || "25", 10) || 25));
+    const limit = boundedInt(artifactLimit, 25, 1, 1000);
+    const scope = artifactScopeParams();
+    const scopeKey = artifactScopeCacheKey(scope);
+    const shouldAppend = append && artifactsScopeKey === scopeKey;
     loading = true;
     error = "";
     try {
       const result = await api.nullTicketsArtifacts(component, name, {
-        taskId: selectedTaskId || undefined,
-        runId: selectedRunId || undefined,
+        ...scope,
         limit,
-        cursor: append ? artifactsCursor || undefined : undefined,
+        cursor: shouldAppend ? artifactsCursor || undefined : undefined,
       });
       const items = normalizeList(result);
-      artifacts = append ? [...artifacts, ...items] : items;
+      artifacts = shouldAppend ? [...artifacts, ...items] : items;
       artifactsCursor = typeof result?.next_cursor === "string" ? result.next_cursor : null;
+      artifactsScopeKey = scopeKey;
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -699,9 +749,10 @@
     message = "";
     try {
       const size = artifactSize.trim() ? Number.parseInt(artifactSize.trim(), 10) : null;
+      const scope = artifactScopeParams();
       const payload: Record<string, any> = {
-        task_id: selectedTaskId || null,
-        run_id: selectedRunId || null,
+        task_id: scope.taskId || null,
+        run_id: scope.runId || null,
         kind: artifactKind.trim(),
         uri: artifactUri.trim(),
         sha256: artifactSha256.trim() || null,
@@ -734,6 +785,10 @@
     clearRunContext();
     artifacts = [];
     artifactsCursor = null;
+    artifactsScopeKey = "";
+    artifactScope = "selected";
+    artifactTaskFilter = "";
+    artifactRunFilter = "";
     claimed = null;
     if (running) {
       void refreshAll();
@@ -921,7 +976,7 @@
                 <button class="btn subtle" onclick={() => (panelView = "runs")} disabled={!selectedRunId}>
                   Run Controls
                 </button>
-                <button class="btn subtle" onclick={() => { panelView = "artifacts"; void loadArtifacts(false); }}>
+                <button class="btn subtle" onclick={openSelectedArtifacts}>
                   Artifacts
                 </button>
               </div>
@@ -1260,6 +1315,42 @@
             <span>{artifacts.length}</span>
           </div>
           <div class="filter-grid">
+            <div class="field wide">
+              <span>Scope</span>
+              <div class="scope-buttons">
+                <button
+                  class:active={artifactScope === "selected"}
+                  onclick={() => setArtifactScope("selected")}
+                  disabled={loading}
+                >
+                  Selected
+                </button>
+                <button
+                  class:active={artifactScope === "custom"}
+                  onclick={() => setArtifactScope("custom")}
+                  disabled={loading}
+                >
+                  Custom
+                </button>
+                <button
+                  class:active={artifactScope === "all"}
+                  onclick={() => setArtifactScope("all")}
+                  disabled={loading}
+                >
+                  All
+                </button>
+              </div>
+            </div>
+            {#if artifactScope === "custom"}
+              <label class="field">
+                <span>Task ID</span>
+                <input bind:value={artifactTaskFilter} placeholder="optional" />
+              </label>
+              <label class="field">
+                <span>Run ID</span>
+                <input bind:value={artifactRunFilter} placeholder="optional" />
+              </label>
+            {/if}
             <label class="field small">
               <span>Limit</span>
               <input bind:value={artifactLimit} inputmode="numeric" />
@@ -1297,6 +1388,7 @@
         <section class="tickets-section">
           <div class="section-header">
             <h3>Create Artifact</h3>
+            <span>{artifactScopeLabel()}</span>
           </div>
           <div class="create-grid">
             <label class="field">
@@ -1399,6 +1491,7 @@
     color: var(--fg-dim);
     font-size: 0.75rem;
     font-family: var(--font-mono);
+    overflow-wrap: anywhere;
   }
   .filter-grid,
   .action-grid,
@@ -1441,6 +1534,38 @@
   .field textarea {
     resize: vertical;
     min-height: 84px;
+  }
+  .scope-buttons {
+    display: inline-flex;
+    width: fit-content;
+    max-width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .scope-buttons button {
+    min-width: 92px;
+    padding: 0.55rem 0.75rem;
+    border: 0;
+    border-right: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg-dim);
+    cursor: pointer;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0;
+  }
+  .scope-buttons button:last-child {
+    border-right: 0;
+  }
+  .scope-buttons button.active {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .scope-buttons button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .field input:focus,
   .field select:focus,

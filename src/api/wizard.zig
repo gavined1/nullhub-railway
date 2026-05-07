@@ -291,6 +291,13 @@ fn wizardHasStep(steps: []const manifest_mod.WizardStep, id: []const u8) bool {
     return false;
 }
 
+fn wizardStepIndex(steps: []const manifest_mod.WizardStep, id: []const u8) ?usize {
+    for (steps, 0..) |step, idx| {
+        if (std.mem.eql(u8, step.id, id)) return idx;
+    }
+    return null;
+}
+
 fn missingNullBoilerLinkStepCount(steps: []const manifest_mod.WizardStep) usize {
     var count: usize = 0;
     if (!wizardHasStep(steps, "tracker_instance")) count += 1;
@@ -299,6 +306,86 @@ fn missingNullBoilerLinkStepCount(steps: []const manifest_mod.WizardStep) usize 
     if (!wizardHasStep(steps, "tracker_success_trigger")) count += 1;
     if (!wizardHasStep(steps, "tracker_max_concurrent_tasks")) count += 1;
     return count;
+}
+
+fn isNullBoilerTrackerStep(step_id: []const u8) bool {
+    return std.mem.eql(u8, step_id, "tracker_enabled") or
+        std.mem.startsWith(u8, step_id, "tracker_");
+}
+
+fn nullBoilerLinkInsertIndex(steps: []const manifest_mod.WizardStep) usize {
+    for (steps, 0..) |step, idx| {
+        if (isNullBoilerTrackerStep(step.id)) return idx;
+    }
+    return steps.len;
+}
+
+fn appendMissingNullBoilerLinkSteps(
+    out_steps: []manifest_mod.WizardStep,
+    next_step: *usize,
+    base_steps: []const manifest_mod.WizardStep,
+    trackers: []const integration_mod.NullTicketsConfig,
+    options: []const manifest_mod.StepOption,
+) void {
+    if (!wizardHasStep(base_steps, "tracker_instance")) {
+        out_steps[next_step.*] = .{
+            .id = "tracker_instance",
+            .title = "Link NullTickets",
+            .description = "Auto-connect this NullBoiler instance to a local NullTickets tracker",
+            .type = .select,
+            .required = false,
+            .options = options,
+            .default_value = if (trackers.len == 1) trackers[0].name else "",
+        };
+        next_step.* += 1;
+    }
+    if (!wizardHasStep(base_steps, "tracker_pipeline_id")) {
+        out_steps[next_step.*] = .{
+            .id = "tracker_pipeline_id",
+            .title = "Tracker Pipeline",
+            .description = "Pipeline id this NullBoiler should claim tasks from.",
+            .type = .text,
+            .required = true,
+            .condition = .{ .step = "tracker_instance", .not_equals = "" },
+        };
+        next_step.* += 1;
+    }
+    if (!wizardHasStep(base_steps, "tracker_claim_role")) {
+        out_steps[next_step.*] = .{
+            .id = "tracker_claim_role",
+            .title = "Claim Role",
+            .description = "Role this worker claims from the selected pipeline.",
+            .type = .text,
+            .required = false,
+            .default_value = "coder",
+            .condition = .{ .step = "tracker_instance", .not_equals = "" },
+        };
+        next_step.* += 1;
+    }
+    if (!wizardHasStep(base_steps, "tracker_success_trigger")) {
+        out_steps[next_step.*] = .{
+            .id = "tracker_success_trigger",
+            .title = "Success Trigger",
+            .description = "Transition to apply when a task completes successfully.",
+            .type = .text,
+            .required = false,
+            .default_value = "complete",
+            .condition = .{ .step = "tracker_instance", .not_equals = "" },
+        };
+        next_step.* += 1;
+    }
+    if (!wizardHasStep(base_steps, "tracker_max_concurrent_tasks")) {
+        out_steps[next_step.*] = .{
+            .id = "tracker_max_concurrent_tasks",
+            .title = "Tracker Concurrency",
+            .description = "Maximum NullTickets tasks this worker may run at once.",
+            .type = .number,
+            .required = false,
+            .default_value = "1",
+            .condition = .{ .step = "tracker_instance", .not_equals = "" },
+        };
+        next_step.* += 1;
+    }
 }
 
 fn isManagedServiceComponent(component_name: []const u8) bool {
@@ -392,74 +479,29 @@ fn augmentWizardManifest(
 
     const steps = allocator.alloc(manifest_mod.WizardStep, base.wizard.steps.len + missing_link_steps) catch return null;
     defer allocator.free(steps);
-    @memcpy(steps[0..base.wizard.steps.len], base.wizard.steps);
+    const insert_index = if (missing_link_steps > 0) nullBoilerLinkInsertIndex(base.wizard.steps) else base.wizard.steps.len;
+    var next_step: usize = 0;
+    var inserted_link_steps = false;
+    for (base.wizard.steps, 0..) |step, idx| {
+        if (!inserted_link_steps and idx == insert_index) {
+            appendMissingNullBoilerLinkSteps(steps, &next_step, base.wizard.steps, trackers, options);
+            inserted_link_steps = true;
+        }
+        steps[next_step] = step;
+        next_step += 1;
+    }
+    if (!inserted_link_steps and next_step < steps.len) {
+        appendMissingNullBoilerLinkSteps(steps, &next_step, base.wizard.steps, trackers, options);
+    }
     if (port_default) |value| {
-        for (steps[0..base.wizard.steps.len]) |*step| {
+        for (steps) |*step| {
             if (std.mem.eql(u8, step.id, "port")) {
                 step.default_value = value;
                 break;
             }
         }
     }
-    var next_step = base.wizard.steps.len;
-    if (missing_link_steps > 0 and !wizardHasStep(base.wizard.steps, "tracker_instance")) {
-        steps[next_step] = .{
-            .id = "tracker_instance",
-            .title = "Link NullTickets",
-            .description = "Auto-connect this NullBoiler instance to a local NullTickets tracker",
-            .type = .select,
-            .required = false,
-            .options = options,
-            .default_value = if (trackers.len == 1) trackers[0].name else "",
-        };
-        next_step += 1;
-    }
-    if (missing_link_steps > 0 and !wizardHasStep(base.wizard.steps, "tracker_pipeline_id")) {
-        steps[next_step] = .{
-            .id = "tracker_pipeline_id",
-            .title = "Tracker Pipeline",
-            .description = "Pipeline id this NullBoiler should claim tasks from.",
-            .type = .text,
-            .required = true,
-            .condition = .{ .step = "tracker_instance", .not_equals = "" },
-        };
-        next_step += 1;
-    }
-    if (missing_link_steps > 0 and !wizardHasStep(base.wizard.steps, "tracker_claim_role")) {
-        steps[next_step] = .{
-            .id = "tracker_claim_role",
-            .title = "Claim Role",
-            .description = "Role this worker claims from the selected pipeline.",
-            .type = .text,
-            .required = false,
-            .default_value = "coder",
-            .condition = .{ .step = "tracker_instance", .not_equals = "" },
-        };
-        next_step += 1;
-    }
-    if (missing_link_steps > 0 and !wizardHasStep(base.wizard.steps, "tracker_success_trigger")) {
-        steps[next_step] = .{
-            .id = "tracker_success_trigger",
-            .title = "Success Trigger",
-            .description = "Transition to apply when a task completes successfully.",
-            .type = .text,
-            .required = false,
-            .default_value = "complete",
-            .condition = .{ .step = "tracker_instance", .not_equals = "" },
-        };
-        next_step += 1;
-    }
-    if (missing_link_steps > 0 and !wizardHasStep(base.wizard.steps, "tracker_max_concurrent_tasks")) {
-        steps[next_step] = .{
-            .id = "tracker_max_concurrent_tasks",
-            .title = "Tracker Concurrency",
-            .description = "Maximum NullTickets tasks this worker may run at once.",
-            .type = .number,
-            .required = false,
-            .default_value = "1",
-            .condition = .{ .step = "tracker_instance", .not_equals = "" },
-        };
-    }
+    std.debug.assert(next_step == steps.len);
 
     var manifest = base;
     manifest.wizard.steps = steps;
@@ -1317,6 +1359,71 @@ test "augmentWizardManifest adds complete nullboiler tracker setup" {
     try std.testing.expect(wizardHasStep(parsed.value.wizard.steps, "tracker_max_concurrent_tasks"));
     try std.testing.expectEqual(@as(usize, 5), parsed.value.wizard.steps.len);
     try std.testing.expectEqualStrings("tracker-a", parsed.value.wizard.steps[0].default_value);
+}
+
+test "augmentWizardManifest inserts nullboiler tracker selector before tracker settings" {
+    const allocator = std.testing.allocator;
+    var fixture = try test_helpers.TempPaths.init(allocator);
+    defer fixture.deinit();
+    try fixture.paths.ensureDirs();
+
+    const state_path = try fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var state = state_mod.State.init(allocator, state_path);
+    defer state.deinit();
+    try state.addInstance("nulltickets", "tracker-a", .{ .version = "v1.0.0" });
+
+    const inst_dir = try fixture.paths.instanceDir(allocator, "nulltickets", "tracker-a");
+    defer allocator.free(inst_dir);
+    try std.fs.makePathAbsolute(inst_dir);
+    const config_path = try fixture.paths.instanceConfig(allocator, "nulltickets", "tracker-a");
+    defer allocator.free(config_path);
+    {
+        const file = try std_compat.fs.createFileAbsolute(config_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("{\"port\":7711}\n");
+    }
+
+    const manifest_json =
+        \\{
+        \\  "schema_version": 1,
+        \\  "name": "nullboiler",
+        \\  "display_name": "NullBoiler",
+        \\  "description": "Orchestrator",
+        \\  "icon": "workflow",
+        \\  "repo": "nullclaw/nullboiler",
+        \\  "platforms": {},
+        \\  "launch": { "command": "server" },
+        \\  "health": { "endpoint": "/health", "port_from_config": "port" },
+        \\  "ports": [{ "name": "api", "config_key": "port", "default": 8080, "protocol": "http" }],
+        \\  "wizard": { "steps": [
+        \\    { "id": "port", "title": "API Port", "type": "number" },
+        \\    { "id": "tracker_enabled", "title": "Enable Tracker", "type": "toggle", "required": false },
+        \\    { "id": "tracker_url", "title": "Tracker URL", "type": "text" },
+        \\    { "id": "tracker_api_token", "title": "Tracker Token", "type": "secret", "required": false },
+        \\    { "id": "tracker_pipeline_id", "title": "Pipeline", "type": "text" },
+        \\    { "id": "tracker_claim_role", "title": "Claim Role", "type": "text" },
+        \\    { "id": "tracker_success_trigger", "title": "Success Trigger", "type": "text" },
+        \\    { "id": "tracker_max_concurrent_tasks", "title": "Max Tasks", "type": "number" }
+        \\  ] },
+        \\  "depends_on": [],
+        \\  "connects_to": []
+        \\}
+    ;
+
+    const rendered = augmentWizardManifest(allocator, "nullboiler", manifest_json, &state, fixture.paths) orelse
+        @panic("augmentWizardManifest");
+    defer allocator.free(rendered);
+
+    const parsed = try manifest_mod.parseManifest(allocator, rendered);
+    defer parsed.deinit();
+
+    const selector_idx = wizardStepIndex(parsed.value.wizard.steps, "tracker_instance") orelse
+        @panic("tracker_instance missing");
+    const enabled_idx = wizardStepIndex(parsed.value.wizard.steps, "tracker_enabled") orelse
+        @panic("tracker_enabled missing");
+    try std.testing.expect(selector_idx < enabled_idx);
+    try std.testing.expectEqual(@as(usize, 9), parsed.value.wizard.steps.len);
 }
 
 test "augmentWizardManifest picks next port for additional nulltickets instance" {
