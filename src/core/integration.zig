@@ -42,6 +42,20 @@ pub const NullBoilerConfig = struct {
     tracker: ?NullBoilerTrackerConfig = null,
 };
 
+pub const NullClawTelemetryLink = struct {
+    configured: bool = false,
+    endpoint: ?[]u8 = null,
+    service_name: ?[]u8 = null,
+    auth_configured: bool = false,
+    source_header_configured: bool = false,
+
+    pub fn deinit(self: *NullClawTelemetryLink, allocator: std.mem.Allocator) void {
+        if (self.endpoint) |value| allocator.free(value);
+        if (self.service_name) |value| allocator.free(value);
+        self.* = .{};
+    }
+};
+
 pub fn listNullTickets(allocator: std.mem.Allocator, state: *state_mod.State, paths: paths_mod.Paths) ![]NullTicketsConfig {
     const names = try state.instanceNames("nulltickets") orelse return allocator.alloc(NullTicketsConfig, 0);
     defer state.allocator.free(names);
@@ -243,6 +257,107 @@ pub fn countLinkedBoilersForTickets(tickets_cfg: NullTicketsConfig, boilers: []c
     return count;
 }
 
+pub fn loadNullClawTelemetryLink(allocator: std.mem.Allocator, paths: paths_mod.Paths, name: []const u8) !NullClawTelemetryLink {
+    const config_path = try paths.instanceConfig(allocator, "nullclaw", name);
+    defer allocator.free(config_path);
+
+    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.NotFound,
+        else => return err,
+    };
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    return try parseNullClawTelemetryLink(allocator, parsed.value);
+}
+
+pub fn linkNullClawToNullWatch(
+    allocator: std.mem.Allocator,
+    paths: paths_mod.Paths,
+    claw_name: []const u8,
+    watch_cfg: NullWatchConfig,
+) !void {
+    const config_path = try paths.instanceConfig(allocator, "nullclaw", claw_name);
+    defer allocator.free(config_path);
+
+    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.NotFound,
+        else => return err,
+    };
+    defer file.close();
+
+    const config_bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(config_bytes);
+
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed_config.deinit();
+    if (parsed_config.value != .object) return error.InvalidConfig;
+
+    const diagnostics_map = try ensureObjectField(allocator, &parsed_config.value.object, "diagnostics");
+    try diagnostics_map.put(allocator, "backend", .{ .string = "otel" });
+
+    const otel_map = try ensureObjectField(allocator, diagnostics_map, "otel");
+    const endpoint = try buildNullWatchEndpoint(allocator, watch_cfg);
+    try otel_map.put(allocator, "endpoint", .{ .string = endpoint });
+
+    const should_default_service = blk: {
+        const service_name = jsonString(otel_map.*, "service_name") orelse break :blk true;
+        break :blk service_name.len == 0 or std.mem.eql(u8, service_name, "nullclaw");
+    };
+    if (should_default_service) {
+        const service_name = try std.fmt.allocPrint(allocator, "nullclaw/{s}", .{claw_name});
+        try otel_map.put(allocator, "service_name", .{ .string = service_name });
+    }
+
+    const headers_map = try ensureObjectField(allocator, otel_map, "headers");
+    try headers_map.put(allocator, "x-nullwatch-source", .{ .string = "nullclaw" });
+    if (watch_cfg.api_token) |token| {
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+        try headers_map.put(allocator, "Authorization", .{ .string = auth_header });
+    } else {
+        _ = headers_map.swapRemove("Authorization");
+    }
+
+    const rendered = try std.json.Stringify.valueAlloc(allocator, parsed_config.value, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    });
+    defer allocator.free(rendered);
+
+    const out = try std_compat.fs.createFileAbsolute(config_path, .{ .truncate = true });
+    defer out.close();
+    try out.writeAll(rendered);
+    try out.writeAll("\n");
+}
+
+pub fn findNullWatchByEndpoint(watches: []const NullWatchConfig, endpoint: ?[]const u8) ?NullWatchConfig {
+    const value = endpoint orelse return null;
+    const port = nullWatchEndpointPort(value) orelse return null;
+    for (watches) |watch| {
+        if (watch.port == port) return watch;
+    }
+    return null;
+}
+
+pub fn buildNullWatchEndpoint(allocator: std.mem.Allocator, watch: NullWatchConfig) ![]u8 {
+    const host = normalizedConnectHost(watch.host);
+    if (std.mem.indexOfScalar(u8, host, ':') != null and !std.mem.startsWith(u8, host, "[")) {
+        return std.fmt.allocPrint(allocator, "http://[{s}]:{d}", .{ host, watch.port });
+    }
+    return std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ host, watch.port });
+}
+
 pub fn extractLocalPort(url: []const u8) ?u16 {
     const uri = std.Uri.parse(url) catch return null;
     const host = uri.host orelse return null;
@@ -254,11 +369,92 @@ pub fn extractLocalPort(url: []const u8) ?u16 {
     };
 }
 
+fn parseNullClawTelemetryLink(allocator: std.mem.Allocator, config: std.json.Value) !NullClawTelemetryLink {
+    const diagnostics = diagnosticsObject(config) orelse return .{};
+    const backend = jsonString(diagnostics, "backend") orelse "";
+    const backend_configured = std.mem.eql(u8, backend, "otel") or std.mem.eql(u8, backend, "otlp");
+
+    var endpoint: ?[]const u8 = null;
+    var service_name: ?[]const u8 = null;
+    if (objectField(diagnostics, "otel")) |otel| {
+        endpoint = jsonString(otel, "endpoint");
+        service_name = jsonString(otel, "service_name");
+    }
+
+    const headers = telemetryHeadersObject(diagnostics);
+    const auth_configured = if (headers) |map| jsonString(map, "Authorization") != null else false;
+    const source_header_configured = if (headers) |map| jsonString(map, "x-nullwatch-source") != null else false;
+
+    return .{
+        .configured = backend_configured and endpoint != null,
+        .endpoint = if (endpoint) |value| try allocator.dupe(u8, value) else null,
+        .service_name = if (service_name) |value| try allocator.dupe(u8, value) else null,
+        .auth_configured = auth_configured,
+        .source_header_configured = source_header_configured,
+    };
+}
+
+fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = obj.get(key) orelse return null;
+    return if (value == .object) value.object else null;
+}
+
+fn diagnosticsObject(config: std.json.Value) ?std.json.ObjectMap {
+    if (config != .object) return null;
+    return objectField(config.object, "diagnostics");
+}
+
+fn telemetryHeadersObject(diagnostics: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (objectField(diagnostics, "otel")) |otel| {
+        if (objectField(otel, "headers")) |headers| return headers;
+    }
+    return null;
+}
+
+fn nullWatchEndpointPort(endpoint: []const u8) ?u16 {
+    if (extractLocalPort(endpoint)) |port| return port;
+    const uri = std.Uri.parse(endpoint) catch return null;
+    return uri.port;
+}
+
+fn normalizedConnectHost(host: []const u8) []const u8 {
+    if (host.len == 0 or
+        std.mem.eql(u8, host, "0.0.0.0") or
+        std.mem.eql(u8, host, "::") or
+        std.mem.eql(u8, host, "[::]") or
+        std.mem.eql(u8, host, "localhost"))
+    {
+        return "127.0.0.1";
+    }
+    return host;
+}
+
 fn isLocalHost(host: []const u8) bool {
     return std.mem.eql(u8, host, "127.0.0.1") or
         std.mem.eql(u8, host, "localhost") or
         std.mem.eql(u8, host, "0.0.0.0") or
         std.mem.eql(u8, host, "::1");
+}
+
+fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn ensureObjectField(
+    allocator: std.mem.Allocator,
+    parent: *std.json.ObjectMap,
+    key: []const u8,
+) !*std.json.ObjectMap {
+    if (parent.getPtr(key)) |value_ptr| {
+        if (value_ptr.* != .object) {
+            value_ptr.* = .{ .object = .empty };
+        }
+        return &value_ptr.object;
+    }
+
+    try parent.put(allocator, key, .{ .object = .empty });
+    return &parent.getPtr(key).?.object;
 }
 
 fn loadPrimaryWorkflowConfig(allocator: std.mem.Allocator, workflows_dir: []const u8) !?NullBoilerWorkflowConfig {

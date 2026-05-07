@@ -14,6 +14,7 @@ const updates_api = @import("api/updates.zig");
 const access = @import("access.zig");
 const mdns_mod = @import("mdns.zig");
 const state_mod = @import("core/state.zig");
+const integration_mod = @import("core/integration.zig");
 const paths_mod = @import("core/paths.zig");
 const manager_mod = @import("supervisor/manager.zig");
 const process_mod = @import("supervisor/process.zig");
@@ -589,15 +590,39 @@ pub const Server = struct {
         }
     };
 
-    const ManagedWatchConfig = struct {
-        host: []const u8 = "127.0.0.1",
-        host_owned: bool = false,
-        api_token: ?[]const u8 = null,
-        api_token_owned: bool = false,
+    const WatchCandidate = struct {
+        name: []const u8,
+        port: u16,
+    };
 
-        fn deinit(self: ManagedWatchConfig, allocator: std.mem.Allocator) void {
-            if (self.host_owned) allocator.free(self.host);
-            if (self.api_token_owned) if (self.api_token) |value| allocator.free(value);
+    const WatchCandidateSelection = struct {
+        running: ?WatchCandidate = null,
+        starting: ?WatchCandidate = null,
+        selected: ?WatchCandidate = null,
+
+        fn prefer(current: ?WatchCandidate, next: WatchCandidate) WatchCandidate {
+            const existing = current orelse return next;
+            return if (std.mem.order(u8, next.name, existing.name) == .lt) next else existing;
+        }
+
+        fn add(self: *@This(), selected_name: ?[]const u8, candidate: WatchCandidate, status: manager_mod.Status) void {
+            if (candidate.port == 0) return;
+
+            switch (status) {
+                .running => {
+                    if (selected_name) |name| {
+                        if (std.mem.eql(u8, name, candidate.name)) self.selected = candidate;
+                    }
+                    self.running = prefer(self.running, candidate);
+                },
+                .starting, .restarting => {
+                    if (selected_name) |name| {
+                        if (std.mem.eql(u8, name, candidate.name)) self.selected = candidate;
+                    }
+                    self.starting = prefer(self.starting, candidate);
+                },
+                .stopped, .stopping, .failed => {},
+            }
         }
     };
 
@@ -610,19 +635,7 @@ pub const Server = struct {
     }
 
     fn getManagedWatchTarget(self: *Server, allocator: std.mem.Allocator, token_override: ?[]const u8, selected_name: ?[]const u8) !WatchTarget {
-        const Candidate = struct {
-            name: []const u8,
-            port: u16,
-
-            fn prefer(current: ?@This(), next: @This()) @This() {
-                const existing = current orelse return next;
-                return if (std.mem.order(u8, next.name, existing.name) == .lt) next else existing;
-            }
-        };
-
-        var running: ?Candidate = null;
-        var starting: ?Candidate = null;
-        var selected: ?Candidate = null;
+        var candidates = WatchCandidateSelection{};
 
         if (self.state.instances.getPtr("nullwatch")) |watch_instances| {
             var state_it = watch_instances.iterator();
@@ -635,24 +648,7 @@ pub const Server = struct {
                     entry.key_ptr.*,
                     entry.value_ptr.*,
                 );
-                if (snapshot.port == 0) continue;
-
-                const candidate = Candidate{ .name = entry.key_ptr.*, .port = snapshot.port };
-                switch (snapshot.status) {
-                    .running => {
-                        if (selected_name) |name| {
-                            if (std.mem.eql(u8, name, candidate.name)) selected = candidate;
-                        }
-                        running = Candidate.prefer(running, candidate);
-                    },
-                    .starting, .restarting => {
-                        if (selected_name) |name| {
-                            if (std.mem.eql(u8, name, candidate.name)) selected = candidate;
-                        }
-                        starting = Candidate.prefer(starting, candidate);
-                    },
-                    .stopped, .stopping, .failed => {},
-                }
+                candidates.add(selected_name, .{ .name = entry.key_ptr.*, .port = snapshot.port }, snapshot.status);
             }
         }
 
@@ -660,51 +656,40 @@ pub const Server = struct {
         while (manager_it.next()) |entry| {
             const inst = entry.value_ptr.*;
             if (!std.mem.eql(u8, inst.component, "nullwatch")) continue;
-            if (inst.port == 0) continue;
-
-            const candidate = Candidate{ .name = inst.name, .port = inst.port };
-            switch (inst.status) {
-                .running => {
-                    if (selected_name) |name| {
-                        if (std.mem.eql(u8, name, candidate.name)) selected = candidate;
-                    }
-                    running = Candidate.prefer(running, candidate);
-                },
-                .starting, .restarting => {
-                    if (selected_name) |name| {
-                        if (std.mem.eql(u8, name, candidate.name)) selected = candidate;
-                    }
-                    starting = Candidate.prefer(starting, candidate);
-                },
-                .stopped, .stopping, .failed => {},
-            }
+            candidates.add(selected_name, .{ .name = inst.name, .port = inst.port }, inst.status);
         }
 
         if (selected_name != null) {
-            if (selected) |candidate| {
+            if (candidates.selected) |candidate| {
                 return try self.buildManagedWatchTarget(allocator, candidate.name, candidate.port, token_override);
             }
             return .{ .token = token_override };
         }
-        if (running) |candidate| {
+        if (candidates.running) |candidate| {
             return try self.buildManagedWatchTarget(allocator, candidate.name, candidate.port, token_override);
         }
-        if (starting) |candidate| {
+        if (candidates.starting) |candidate| {
             return try self.buildManagedWatchTarget(allocator, candidate.name, candidate.port, token_override);
         }
         return .{ .token = token_override };
     }
 
     fn buildManagedWatchTarget(self: *Server, allocator: std.mem.Allocator, name: []const u8, port: u16, token_override: ?[]const u8) !WatchTarget {
-        var cfg = try self.loadManagedWatchConfig(allocator, name);
-        defer cfg.deinit(allocator);
-
-        const url_host = try normalizeWatchUrlHost(allocator, cfg.host);
-        defer allocator.free(url_host);
+        var cfg = (try integration_mod.loadNullWatchConfig(allocator, self.paths, name)) orelse blk: {
+            const cfg_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(cfg_name);
+            const cfg_host = try allocator.dupe(u8, "127.0.0.1");
+            break :blk integration_mod.NullWatchConfig{
+                .name = cfg_name,
+                .host = cfg_host,
+            };
+        };
+        defer integration_mod.deinitNullWatchConfig(allocator, &cfg);
+        cfg.port = port;
 
         var target = WatchTarget{};
         errdefer target.deinit(allocator);
-        target.url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ url_host, port });
+        target.url = try integration_mod.buildNullWatchEndpoint(allocator, cfg);
         target.url_owned = true;
         if (token_override) |token| {
             target.token = token;
@@ -713,49 +698,6 @@ pub const Server = struct {
             target.token_owned = true;
         }
         return target;
-    }
-
-    fn loadManagedWatchConfig(self: *Server, allocator: std.mem.Allocator, name: []const u8) !ManagedWatchConfig {
-        const config_path = self.paths.instanceConfig(allocator, "nullwatch", name) catch return .{};
-        defer allocator.free(config_path);
-
-        const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch return .{};
-        defer file.close();
-
-        const contents = file.readToEndAlloc(allocator, 1024 * 1024) catch return .{};
-        defer allocator.free(contents);
-
-        const parsed = std.json.parseFromSlice(
-            struct {
-                host: []const u8 = "127.0.0.1",
-                api_token: ?[]const u8 = null,
-            },
-            allocator,
-            contents,
-            .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
-        ) catch return .{};
-        defer parsed.deinit();
-
-        return .{
-            .host = try allocator.dupe(u8, parsed.value.host),
-            .host_owned = true,
-            .api_token = if (parsed.value.api_token) |token| try allocator.dupe(u8, token) else null,
-            .api_token_owned = parsed.value.api_token != null,
-        };
-    }
-
-    fn normalizeWatchUrlHost(allocator: std.mem.Allocator, host: []const u8) ![]const u8 {
-        if (host.len == 0 or
-            std.mem.eql(u8, host, "0.0.0.0") or
-            std.mem.eql(u8, host, "::"))
-        {
-            return allocator.dupe(u8, "127.0.0.1");
-        }
-
-        if (std.mem.indexOfScalar(u8, host, ':') != null and !std.mem.startsWith(u8, host, "[")) {
-            return std.fmt.allocPrint(allocator, "[{s}]", .{host});
-        }
-        return allocator.dupe(u8, host);
     }
 
     fn routeWithoutServerMutex(target: []const u8) bool {
