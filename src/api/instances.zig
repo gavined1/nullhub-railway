@@ -398,6 +398,17 @@ fn listNullBoilersLocked(
     return integration_mod.listNullBoilers(allocator, state, paths);
 }
 
+fn listNullWatchLocked(
+    allocator: std.mem.Allocator,
+    mutex: *std_compat.sync.Mutex,
+    state: *state_mod.State,
+    paths: paths_mod.Paths,
+) ![]integration_mod.NullWatchConfig {
+    mutex.lock();
+    defer mutex.unlock();
+    return integration_mod.listNullWatch(allocator, state, paths);
+}
+
 const PipelineSummary = struct {
     id: []const u8,
     name: []const u8,
@@ -410,6 +421,19 @@ const TrackerIntegrationOption = struct {
     port: u16,
     running: bool,
     pipelines: []const PipelineSummary = &.{},
+};
+
+const WatchIntegrationOption = struct {
+    name: []const u8,
+    host: []const u8,
+    port: u16,
+    running: bool,
+};
+
+const ClawIntegrationOption = struct {
+    name: []const u8,
+    running: bool,
+    linked: bool,
 };
 
 fn fetchPipelineSummaries(allocator: std.mem.Allocator, url: []const u8, bearer_token: ?[]const u8) ?[]PipelineSummary {
@@ -543,6 +567,93 @@ fn pipelineContainsString(values: []const []const u8, candidate: []const u8) boo
         if (std.mem.eql(u8, value, candidate)) return true;
     }
     return false;
+}
+
+const NullClawTelemetryLink = struct {
+    configured: bool = false,
+    endpoint: ?[]const u8 = null,
+    service_name: ?[]const u8 = null,
+    auth_configured: bool = false,
+    source_header_configured: bool = false,
+};
+
+fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = obj.get(key) orelse return null;
+    return if (value == .object) value.object else null;
+}
+
+fn diagnosticsObject(config: std.json.Value) ?std.json.ObjectMap {
+    if (config != .object) return null;
+    return objectField(config.object, "diagnostics");
+}
+
+fn telemetryHeadersObject(diagnostics: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (objectField(diagnostics, "otel")) |otel| {
+        if (objectField(otel, "headers")) |headers| return headers;
+    }
+    return objectField(diagnostics, "otel_headers");
+}
+
+fn parseNullClawTelemetryLink(config: std.json.Value) NullClawTelemetryLink {
+    const diagnostics = diagnosticsObject(config) orelse return .{};
+    const backend = jsonStringOrEmpty(diagnostics, "backend");
+    const backend_configured = std.mem.eql(u8, backend, "otel") or std.mem.eql(u8, backend, "otlp");
+
+    var endpoint: ?[]const u8 = null;
+    var service_name: ?[]const u8 = null;
+    if (objectField(diagnostics, "otel")) |otel| {
+        endpoint = jsonString(otel, "endpoint");
+        service_name = jsonString(otel, "service_name");
+    }
+    if (endpoint == null) endpoint = jsonString(diagnostics, "otel_endpoint");
+    if (service_name == null) service_name = jsonString(diagnostics, "otel_service_name");
+
+    const headers = telemetryHeadersObject(diagnostics);
+    const auth_configured = if (headers) |map| jsonString(map, "Authorization") != null else false;
+    const source_header_configured = if (headers) |map| jsonString(map, "x-nullwatch-source") != null else false;
+
+    return .{
+        .configured = backend_configured and endpoint != null,
+        .endpoint = endpoint,
+        .service_name = service_name,
+        .auth_configured = auth_configured,
+        .source_header_configured = source_header_configured,
+    };
+}
+
+fn findNullWatchByEndpoint(watches: []const integration_mod.NullWatchConfig, endpoint: ?[]const u8) ?integration_mod.NullWatchConfig {
+    const value = endpoint orelse return null;
+    const port = nullWatchEndpointPort(value) orelse return null;
+    for (watches) |watch| {
+        if (watch.port == port) return watch;
+    }
+    return null;
+}
+
+fn nullWatchEndpointPort(endpoint: []const u8) ?u16 {
+    if (integration_mod.extractLocalPort(endpoint)) |port| return port;
+    const uri = std.Uri.parse(endpoint) catch return null;
+    return uri.port;
+}
+
+fn normalizedConnectHost(host: []const u8) []const u8 {
+    if (host.len == 0 or
+        std.mem.eql(u8, host, "0.0.0.0") or
+        std.mem.eql(u8, host, "::") or
+        std.mem.eql(u8, host, "[::]") or
+        std.mem.eql(u8, host, "localhost"))
+    {
+        return "127.0.0.1";
+    }
+    return host;
+}
+
+fn buildNullWatchEndpoint(allocator: std.mem.Allocator, watch: integration_mod.NullWatchConfig) ?[]const u8 {
+    const host = normalizedConnectHost(watch.host);
+    if (std.mem.indexOfScalar(u8, host, ':') != null and !std.mem.startsWith(u8, host, "[")) {
+        return std.fmt.allocPrint(allocator, "http://[{s}]:{d}", .{ host, watch.port }) catch null;
+    }
+    return std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ host, watch.port }) catch null;
 }
 
 fn ensurePath(path: []const u8) !void {
@@ -3389,6 +3500,113 @@ fn handleIntegrationGet(
     component: []const u8,
     name: []const u8,
 ) ApiResponse {
+    if (std.mem.eql(u8, component, "nullclaw")) {
+        const config_path = paths.instanceConfig(allocator, "nullclaw", name) catch return helpers.serverError();
+        defer allocator.free(config_path);
+        const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch return notFound();
+        defer file.close();
+        const config_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return helpers.serverError();
+        defer allocator.free(config_bytes);
+
+        var parsed_config = std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return helpers.serverError();
+        defer parsed_config.deinit();
+
+        const link = parseNullClawTelemetryLink(parsed_config.value);
+        const watches = listNullWatchLocked(allocator, mutex, s, paths) catch return helpers.serverError();
+        defer integration_mod.deinitNullWatchConfigs(allocator, watches);
+        const linked = findNullWatchByEndpoint(watches, link.endpoint);
+
+        var watch_options: std.ArrayListUnmanaged(WatchIntegrationOption) = .empty;
+        defer watch_options.deinit(allocator);
+        for (watches) |watch| {
+            const is_running = blk: {
+                const status = getStatusLocked(mutex, manager, "nullwatch", watch.name) orelse break :blk false;
+                break :blk status.status == .running;
+            };
+            watch_options.append(allocator, .{
+                .name = watch.name,
+                .host = watch.host,
+                .port = watch.port,
+                .running = is_running,
+            }) catch return helpers.serverError();
+        }
+
+        const body = std.json.Stringify.valueAlloc(allocator, .{
+            .kind = "nullclaw",
+            .configured = link.configured,
+            .linked_watch = if (linked) |watch| .{
+                .name = watch.name,
+                .host = watch.host,
+                .port = watch.port,
+            } else null,
+            .available_watches = watch_options.items,
+            .current_link = if (link.endpoint) |endpoint| .{
+                .endpoint = endpoint,
+                .service_name = link.service_name orelse "",
+                .auth_header = link.auth_configured,
+                .source_header = link.source_header_configured,
+            } else null,
+        }, .{ .emit_null_optional_fields = false }) catch return helpers.serverError();
+        return jsonOk(body);
+    }
+
+    if (std.mem.eql(u8, component, "nullwatch")) {
+        var watch_cfg = integration_mod.loadNullWatchConfig(allocator, paths, name) catch null orelse return notFound();
+        defer integration_mod.deinitNullWatchConfig(allocator, &watch_cfg);
+
+        const claw_names_opt = blk: {
+            mutex.lock();
+            defer mutex.unlock();
+            break :blk s.instanceNames("nullclaw") catch return helpers.serverError();
+        };
+        defer if (claw_names_opt) |claw_names| s.allocator.free(claw_names);
+
+        var claw_options: std.ArrayListUnmanaged(ClawIntegrationOption) = .empty;
+        defer claw_options.deinit(allocator);
+        if (claw_names_opt) |claw_names| {
+            for (claw_names) |claw_name| {
+                const is_running = blk: {
+                    const status = getStatusLocked(mutex, manager, "nullclaw", claw_name) orelse break :blk false;
+                    break :blk status.status == .running;
+                };
+                const is_linked = blk: {
+                    const config_path = paths.instanceConfig(allocator, "nullclaw", claw_name) catch break :blk false;
+                    defer allocator.free(config_path);
+                    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch break :blk false;
+                    defer file.close();
+                    const config_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch break :blk false;
+                    defer allocator.free(config_bytes);
+                    var parsed_config = std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{
+                        .allocate = .alloc_always,
+                        .ignore_unknown_fields = true,
+                    }) catch break :blk false;
+                    defer parsed_config.deinit();
+                    const link = parseNullClawTelemetryLink(parsed_config.value);
+                    break :blk findNullWatchByEndpoint(&.{watch_cfg}, link.endpoint) != null;
+                };
+                claw_options.append(allocator, .{
+                    .name = claw_name,
+                    .running = is_running,
+                    .linked = is_linked,
+                }) catch return helpers.serverError();
+            }
+        }
+
+        const body = std.json.Stringify.valueAlloc(allocator, .{
+            .kind = "nullwatch",
+            .watch = .{
+                .name = watch_cfg.name,
+                .host = watch_cfg.host,
+                .port = watch_cfg.port,
+            },
+            .available_claws = claw_options.items,
+        }, .{ .emit_null_optional_fields = false }) catch return helpers.serverError();
+        return jsonOk(body);
+    }
+
     if (std.mem.eql(u8, component, "nullboiler")) {
         var boiler_cfg = integration_mod.loadNullBoilerConfig(allocator, paths, name) catch null orelse return notFound();
         defer integration_mod.deinitNullBoilerConfig(allocator, &boiler_cfg);
@@ -3540,6 +3758,74 @@ fn handleIntegrationGet(
     return notFound();
 }
 
+fn linkNullClawTelemetry(
+    allocator: std.mem.Allocator,
+    s: *state_mod.State,
+    manager: *manager_mod.Manager,
+    mutex: *std_compat.sync.Mutex,
+    paths: paths_mod.Paths,
+    claw_name: []const u8,
+    watch_cfg: integration_mod.NullWatchConfig,
+) ApiResponse {
+    const config_path = paths.instanceConfig(allocator, "nullclaw", claw_name) catch return helpers.serverError();
+    defer allocator.free(config_path);
+    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch return notFound();
+    defer file.close();
+    const config_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return helpers.serverError();
+    defer allocator.free(config_bytes);
+
+    var parsed_config = std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return helpers.serverError();
+    defer parsed_config.deinit();
+    if (parsed_config.value != .object) return helpers.serverError();
+
+    const diagnostics_map = ensureObjectField(allocator, &parsed_config.value.object, "diagnostics") catch return helpers.serverError();
+    diagnostics_map.put(allocator, "backend", .{ .string = "otel" }) catch return helpers.serverError();
+
+    const otel_map = ensureObjectField(allocator, diagnostics_map, "otel") catch return helpers.serverError();
+    const endpoint = buildNullWatchEndpoint(allocator, watch_cfg) orelse return helpers.serverError();
+    otel_map.put(allocator, "endpoint", .{ .string = endpoint }) catch return helpers.serverError();
+
+    const existing_service_name = jsonString(otel_map.*, "service_name") orelse jsonString(diagnostics_map.*, "otel_service_name");
+    const service_name = if (existing_service_name) |value| blk: {
+        if (value.len > 0 and !std.mem.eql(u8, value, "nullclaw")) break :blk value;
+        break :blk std.fmt.allocPrint(allocator, "nullclaw/{s}", .{claw_name}) catch return helpers.serverError();
+    } else std.fmt.allocPrint(allocator, "nullclaw/{s}", .{claw_name}) catch return helpers.serverError();
+    otel_map.put(allocator, "service_name", .{ .string = service_name }) catch return helpers.serverError();
+
+    const headers_map = ensureObjectField(allocator, otel_map, "headers") catch return helpers.serverError();
+    headers_map.put(allocator, "x-nullwatch-source", .{ .string = "nullclaw" }) catch return helpers.serverError();
+    if (watch_cfg.api_token) |token| {
+        const auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{token}) catch return helpers.serverError();
+        headers_map.put(allocator, "Authorization", .{ .string = auth_header }) catch return helpers.serverError();
+    } else {
+        _ = headers_map.swapRemove("Authorization");
+    }
+
+    const rendered = std.json.Stringify.valueAlloc(allocator, parsed_config.value, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    }) catch return helpers.serverError();
+    defer allocator.free(rendered);
+
+    const out = std_compat.fs.createFileAbsolute(config_path, .{ .truncate = true }) catch return helpers.serverError();
+    defer out.close();
+    out.writeAll(rendered) catch return helpers.serverError();
+    out.writeAll("\n") catch return helpers.serverError();
+
+    if (getStatusLocked(mutex, manager, "nullclaw", claw_name)) |status| {
+        if (status.status == .running) {
+            mutex.lock();
+            defer mutex.unlock();
+            return handleRestart(allocator, s, manager, paths, "nullclaw", claw_name, "");
+        }
+    }
+
+    return jsonOk("{\"status\":\"linked\"}");
+}
+
 fn handleIntegrationPost(
     allocator: std.mem.Allocator,
     s: *state_mod.State,
@@ -3550,7 +3836,52 @@ fn handleIntegrationPost(
     name: []const u8,
     body: []const u8,
 ) ApiResponse {
-    if (!std.mem.eql(u8, component, "nullboiler")) return badRequest("{\"error\":\"integration updates are only supported for nullboiler\"}");
+    if (std.mem.eql(u8, component, "nullclaw")) {
+        const watch_cfg = blk: {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            }) catch return badRequest("{\"error\":\"invalid JSON body\"}");
+            defer parsed.deinit();
+            if (parsed.value != .object) return badRequest("{\"error\":\"invalid JSON body\"}");
+            const watch_name = if (parsed.value.object.get("watch_instance")) |value|
+                if (value == .string and value.string.len > 0) value.string else null
+            else
+                null;
+            if (watch_name == null) return badRequest("{\"error\":\"watch_instance is required\"}");
+            break :blk integration_mod.loadNullWatchConfig(allocator, paths, watch_name.?) catch null orelse return notFound();
+        };
+        defer {
+            var owned_cfg = watch_cfg;
+            integration_mod.deinitNullWatchConfig(allocator, &owned_cfg);
+        }
+
+        return linkNullClawTelemetry(allocator, s, manager, mutex, paths, name, watch_cfg);
+    }
+
+    if (std.mem.eql(u8, component, "nullwatch")) {
+        const claw_name = blk: {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            }) catch return badRequest("{\"error\":\"invalid JSON body\"}");
+            defer parsed.deinit();
+            if (parsed.value != .object) return badRequest("{\"error\":\"invalid JSON body\"}");
+            const value = if (parsed.value.object.get("claw_instance")) |item|
+                if (item == .string and item.string.len > 0) item.string else null
+            else
+                null;
+            if (value == null) return badRequest("{\"error\":\"claw_instance is required\"}");
+            break :blk allocator.dupe(u8, value.?) catch return helpers.serverError();
+        };
+        defer allocator.free(claw_name);
+
+        var watch_cfg = integration_mod.loadNullWatchConfig(allocator, paths, name) catch null orelse return notFound();
+        defer integration_mod.deinitNullWatchConfig(allocator, &watch_cfg);
+        return linkNullClawTelemetry(allocator, s, manager, mutex, paths, claw_name, watch_cfg);
+    }
+
+    if (!std.mem.eql(u8, component, "nullboiler")) return badRequest("{\"error\":\"integration updates are only supported for nullclaw, nullwatch, and nullboiler\"}");
 
     const tracker_cfg = blk: {
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
@@ -5353,6 +5684,198 @@ test "dispatch routes GET integration action for linked nullboiler" {
     try std.testing.expectEqualStrings("reviewer", current_link.get("claim_role").?.string);
     try std.testing.expectEqualStrings("complete", current_link.get("success_trigger").?.string);
     try std.testing.expectEqual(@as(i64, 2), current_link.get("max_concurrent_tasks").?.integer);
+}
+
+test "dispatch routes GET integration action for nullclaw nullwatch telemetry" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "observer-a", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "my-agent", .{ .version = "1.0.0" });
+
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "observer-a", "{\"host\":\"127.0.0.1\",\"port\":7711,\"api_token\":\"watch-token\"}");
+    try writeTestInstanceConfig(
+        allocator,
+        mctx.paths,
+        "nullclaw",
+        "my-agent",
+        "{\"diagnostics\":{\"backend\":\"otel\",\"otel\":{\"endpoint\":\"http://127.0.0.1:7711\",\"service_name\":\"nullclaw/my-agent\",\"headers\":{\"Authorization\":\"Bearer watch-token\",\"x-nullwatch-source\":\"nullclaw\"}}}}",
+    );
+
+    const resp = dispatch(allocator, &s, &mctx.manager, &mctx.mutex, mctx.paths, "GET", "/api/instances/nullclaw/my-agent/integration", "").?;
+    defer allocator.free(resp.body);
+
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("nullclaw", parsed.value.object.get("kind").?.string);
+    try std.testing.expect(parsed.value.object.get("configured").?.bool);
+    const linked = parsed.value.object.get("linked_watch").?.object;
+    try std.testing.expectEqualStrings("observer-a", linked.get("name").?.string);
+    try std.testing.expectEqual(@as(i64, 7711), linked.get("port").?.integer);
+    const current_link = parsed.value.object.get("current_link").?.object;
+    try std.testing.expectEqualStrings("http://127.0.0.1:7711", current_link.get("endpoint").?.string);
+    try std.testing.expectEqualStrings("nullclaw/my-agent", current_link.get("service_name").?.string);
+    try std.testing.expect(current_link.get("auth_header").?.bool);
+    try std.testing.expect(current_link.get("source_header").?.bool);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("available_watches").?.array.items.len);
+}
+
+test "dispatch routes POST integration action for nullclaw links nullwatch" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "observer-a", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "my-agent", .{ .version = "1.0.0" });
+
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "observer-a", "{\"host\":\"0.0.0.0\",\"port\":7712,\"api_token\":\"watch-token\"}");
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullclaw", "my-agent", "{\"diagnostics\":{\"backend\":\"jsonl\",\"log_tool_calls\":true,\"otel\":{\"service_name\":\"nullclaw\"}}}");
+
+    const resp = dispatch(
+        allocator,
+        &s,
+        &mctx.manager,
+        &mctx.mutex,
+        mctx.paths,
+        "POST",
+        "/api/instances/nullclaw/my-agent/integration",
+        "{\"watch_instance\":\"observer-a\"}",
+    ).?;
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+
+    const config_path = try mctx.paths.instanceConfig(allocator, "nullclaw", "my-agent");
+    defer allocator.free(config_path);
+    const config_bytes = try std.fs.readFileAbsolute(allocator, config_path, 1024 * 1024);
+    defer allocator.free(config_bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const diagnostics = parsed.value.object.get("diagnostics").?.object;
+    try std.testing.expectEqualStrings("otel", diagnostics.get("backend").?.string);
+    try std.testing.expect(diagnostics.get("log_tool_calls").?.bool);
+    const otel = diagnostics.get("otel").?.object;
+    try std.testing.expectEqualStrings("http://127.0.0.1:7712", otel.get("endpoint").?.string);
+    try std.testing.expectEqualStrings("nullclaw/my-agent", otel.get("service_name").?.string);
+    const headers = otel.get("headers").?.object;
+    try std.testing.expectEqualStrings("Bearer watch-token", headers.get("Authorization").?.string);
+    try std.testing.expectEqualStrings("nullclaw", headers.get("x-nullwatch-source").?.string);
+}
+
+test "dispatch routes GET integration action for nullwatch lists linked nullclaws" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "observer-a", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "linked-agent", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "plain-agent", .{ .version = "1.0.0" });
+
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "observer-a", "{\"port\":7711}");
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullclaw", "linked-agent", "{\"diagnostics\":{\"backend\":\"otel\",\"otel\":{\"endpoint\":\"http://127.0.0.1:7711\",\"service_name\":\"nullclaw/linked-agent\"}}}");
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullclaw", "plain-agent", "{\"diagnostics\":{\"backend\":\"jsonl\"}}");
+
+    const resp = dispatch(allocator, &s, &mctx.manager, &mctx.mutex, mctx.paths, "GET", "/api/instances/nullwatch/observer-a/integration", "").?;
+    defer allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("nullwatch", parsed.value.object.get("kind").?.string);
+    const claws = parsed.value.object.get("available_claws").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), claws.len);
+
+    var linked_found = false;
+    var plain_found = false;
+    for (claws) |claw| {
+        const obj = claw.object;
+        if (std.mem.eql(u8, obj.get("name").?.string, "linked-agent")) {
+            linked_found = obj.get("linked").?.bool;
+        }
+        if (std.mem.eql(u8, obj.get("name").?.string, "plain-agent")) {
+            plain_found = !obj.get("linked").?.bool;
+        }
+    }
+    try std.testing.expect(linked_found);
+    try std.testing.expect(plain_found);
+}
+
+test "dispatch routes POST integration action for nullwatch links selected nullclaw" {
+    const allocator = std.testing.allocator;
+    var state_fixture = try test_helpers.TempPaths.init(allocator);
+    defer state_fixture.deinit();
+    const state_path = try state_fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var s = state_mod.State.init(allocator, state_path);
+    defer s.deinit();
+    var mctx = TestManagerCtx.init(allocator);
+    defer mctx.deinit(allocator);
+
+    try s.addInstance("nullwatch", "observer-a", .{ .version = "1.0.0" });
+    try s.addInstance("nullclaw", "my-agent", .{ .version = "1.0.0" });
+
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullwatch", "observer-a", "{\"port\":7713}");
+    try writeTestInstanceConfig(allocator, mctx.paths, "nullclaw", "my-agent", "{\"diagnostics\":{\"backend\":\"jsonl\"}}");
+
+    const resp = dispatch(
+        allocator,
+        &s,
+        &mctx.manager,
+        &mctx.mutex,
+        mctx.paths,
+        "POST",
+        "/api/instances/nullwatch/observer-a/integration",
+        "{\"claw_instance\":\"my-agent\"}",
+    ).?;
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+
+    const config_path = try mctx.paths.instanceConfig(allocator, "nullclaw", "my-agent");
+    defer allocator.free(config_path);
+    const config_bytes = try std.fs.readFileAbsolute(allocator, config_path, 1024 * 1024);
+    defer allocator.free(config_bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const diagnostics = parsed.value.object.get("diagnostics").?.object;
+    try std.testing.expectEqualStrings("otel", diagnostics.get("backend").?.string);
+    const otel = diagnostics.get("otel").?.object;
+    try std.testing.expectEqualStrings("http://127.0.0.1:7713", otel.get("endpoint").?.string);
+    try std.testing.expectEqualStrings("nullclaw/my-agent", otel.get("service_name").?.string);
 }
 
 test "dispatch routes POST integration action for nullboiler" {

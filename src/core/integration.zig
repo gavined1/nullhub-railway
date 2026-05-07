@@ -9,6 +9,13 @@ pub const NullTicketsConfig = struct {
     api_token: ?[]const u8 = null,
 };
 
+pub const NullWatchConfig = struct {
+    name: []const u8,
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 7710,
+    api_token: ?[]const u8 = null,
+};
+
 pub const NullBoilerWorkflowConfig = struct {
     file_name: []const u8,
     pipeline_id: []const u8,
@@ -37,6 +44,7 @@ pub const NullBoilerConfig = struct {
 
 pub fn listNullTickets(allocator: std.mem.Allocator, state: *state_mod.State, paths: paths_mod.Paths) ![]NullTicketsConfig {
     const names = try state.instanceNames("nulltickets") orelse return allocator.alloc(NullTicketsConfig, 0);
+    defer state.allocator.free(names);
     var list: std.ArrayListUnmanaged(NullTicketsConfig) = .empty;
     errdefer deinitNullTicketsConfigs(allocator, list.items);
     defer list.deinit(allocator);
@@ -52,8 +60,27 @@ pub fn listNullTickets(allocator: std.mem.Allocator, state: *state_mod.State, pa
     return list.toOwnedSlice(allocator);
 }
 
+pub fn listNullWatch(allocator: std.mem.Allocator, state: *state_mod.State, paths: paths_mod.Paths) ![]NullWatchConfig {
+    const names = try state.instanceNames("nullwatch") orelse return allocator.alloc(NullWatchConfig, 0);
+    defer state.allocator.free(names);
+    var list: std.ArrayListUnmanaged(NullWatchConfig) = .empty;
+    errdefer deinitNullWatchConfigs(allocator, list.items);
+    defer list.deinit(allocator);
+
+    for (names) |name| {
+        if (try loadNullWatchConfig(allocator, paths, name)) |cfg| {
+            var owned = cfg;
+            errdefer deinitNullWatchConfig(allocator, &owned);
+            try list.append(allocator, owned);
+        }
+    }
+
+    return list.toOwnedSlice(allocator);
+}
+
 pub fn listNullBoilers(allocator: std.mem.Allocator, state: *state_mod.State, paths: paths_mod.Paths) ![]NullBoilerConfig {
     const names = try state.instanceNames("nullboiler") orelse return allocator.alloc(NullBoilerConfig, 0);
+    defer state.allocator.free(names);
     var list: std.ArrayListUnmanaged(NullBoilerConfig) = .empty;
     errdefer deinitNullBoilerConfigs(allocator, list.items);
     defer list.deinit(allocator);
@@ -86,6 +113,29 @@ pub fn loadNullTicketsConfig(allocator: std.mem.Allocator, paths: paths_mod.Path
 
     return .{
         .name = try allocator.dupe(u8, name),
+        .port = parsed.value.port,
+        .api_token = if (parsed.value.api_token) |token| try allocator.dupe(u8, token) else null,
+    };
+}
+
+pub fn loadNullWatchConfig(allocator: std.mem.Allocator, paths: paths_mod.Paths, name: []const u8) !?NullWatchConfig {
+    const config_path = paths.instanceConfig(allocator, "nullwatch", name) catch return null;
+    defer allocator.free(config_path);
+
+    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch return null;
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(NullWatchConfigFile, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .host = try allocator.dupe(u8, parsed.value.host),
         .port = parsed.value.port,
         .api_token = if (parsed.value.api_token) |token| try allocator.dupe(u8, token) else null,
     };
@@ -135,6 +185,18 @@ pub fn deinitNullTicketsConfig(allocator: std.mem.Allocator, cfg: *NullTicketsCo
 
 pub fn deinitNullTicketsConfigs(allocator: std.mem.Allocator, configs: []NullTicketsConfig) void {
     for (configs) |*cfg| deinitNullTicketsConfig(allocator, cfg);
+    allocator.free(configs);
+}
+
+pub fn deinitNullWatchConfig(allocator: std.mem.Allocator, cfg: *NullWatchConfig) void {
+    allocator.free(cfg.name);
+    allocator.free(cfg.host);
+    if (cfg.api_token) |token| allocator.free(token);
+    cfg.* = undefined;
+}
+
+pub fn deinitNullWatchConfigs(allocator: std.mem.Allocator, configs: []NullWatchConfig) void {
+    for (configs) |*cfg| deinitNullWatchConfig(allocator, cfg);
     allocator.free(configs);
 }
 
@@ -256,6 +318,12 @@ fn resolveRelativePath(allocator: std.mem.Allocator, base_dir: []const u8, value
 
 const NullTicketsConfigFile = struct {
     port: u16 = 7700,
+    api_token: ?[]const u8 = null,
+};
+
+const NullWatchConfigFile = struct {
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 7710,
     api_token: ?[]const u8 = null,
 };
 

@@ -32,6 +32,8 @@
   let integrationLoading = $state(false);
   let integrationError = $state<string | null>(null);
   let linkingIntegration = $state(false);
+  let selectedWatch = $state("");
+  let selectedClaw = $state("");
   let selectedTracker = $state("");
   let selectedPipeline = $state("");
   let trackerClaimRole = $state("coder");
@@ -92,7 +94,10 @@
       : "",
   );
   let supportsIntegration = $derived(
-    component === "nullboiler" || component === "nulltickets",
+    component === "nullclaw" ||
+      component === "nullwatch" ||
+      component === "nullboiler" ||
+      component === "nulltickets",
   );
   let supportsAgentData = $derived(component === "nullclaw");
   let supportsChat = $derived(component === "nullclaw");
@@ -102,6 +107,11 @@
   let queueSummary = $derived(summarizeQueue(integration?.queue));
   let linkedBoilers = $derived(integration?.linked_boilers || []);
   let trackerOptions = $derived(integration?.available_trackers || []);
+  let watchOptions = $derived(integration?.available_watches || []);
+  let linkedWatch = $derived(integration?.linked_watch || null);
+  let currentTelemetryLink = $derived(integration?.current_link || null);
+  let clawOptions = $derived(integration?.available_claws || []);
+  let linkedClaws = $derived(clawOptions.filter((claw: any) => claw?.linked));
   let selectedTrackerOption = $derived(
     trackerOptions.find((tracker: any) => tracker?.name === selectedTracker) || null,
   );
@@ -451,6 +461,19 @@
           currentLink?.success_trigger || trackerSuccessTrigger || "complete";
         trackerConcurrency =
           String(currentLink?.max_concurrent_tasks || trackerConcurrency || "1");
+      } else if (component === "nullclaw") {
+        selectedWatch =
+          integration?.linked_watch?.name ||
+          selectedWatch ||
+          integration?.available_watches?.[0]?.name ||
+          "";
+      } else if (component === "nullwatch") {
+        const unlinked = integration?.available_claws?.find((claw: any) => !claw?.linked);
+        selectedClaw =
+          selectedClaw ||
+          unlinked?.name ||
+          integration?.available_claws?.[0]?.name ||
+          "";
       }
     } catch (e) {
       integration = null;
@@ -473,6 +496,30 @@
         max_concurrent_tasks: Math.max(1, Number(trackerConcurrency || "1") || 1),
       };
       await api.linkIntegration(component, name, payload);
+      await refresh();
+    } finally {
+      linkingIntegration = false;
+    }
+  }
+
+  async function linkNullWatch() {
+    if (component !== "nullclaw" || !selectedWatch) return;
+
+    linkingIntegration = true;
+    try {
+      await api.linkIntegration(component, name, { watch_instance: selectedWatch });
+      await refresh();
+    } finally {
+      linkingIntegration = false;
+    }
+  }
+
+  async function linkNullClawToWatch() {
+    if (component !== "nullwatch" || !selectedClaw) return;
+
+    linkingIntegration = true;
+    try {
+      await api.linkIntegration(component, name, { claw_instance: selectedClaw });
       await refresh();
     } finally {
       linkingIntegration = false;
@@ -634,6 +681,10 @@
     usageData = null;
     integration = null;
     integrationError = null;
+    selectedWatch = "";
+    selectedClaw = "";
+    selectedTracker = "";
+    selectedPipeline = "";
     onboardingStatus = null;
     bootstrapChatAutoOpenedFor = "";
     lastUsageRefreshAt = 0;
@@ -885,9 +936,15 @@
           <div class="info-card integration-card">
             <div class="integration-header">
               <span class="label"
-                >{component === "nullboiler" ? "NullTickets Link" : "Linked NullBoilers"}</span
+                >{component === "nullclaw"
+                  ? "NullWatch Telemetry"
+                  : component === "nullwatch"
+                    ? "Observed NullClaws"
+                  : component === "nullboiler"
+                    ? "NullTickets Link"
+                    : "Linked NullBoilers"}</span
               >
-              {#if component === "nullboiler" && integration?.linked_tracker}
+              {#if (component === "nullboiler" && integration?.linked_tracker) || (component === "nullclaw" && linkedWatch) || (component === "nullwatch" && linkedClaws.length > 0)}
                 <span class="integration-badge">Linked</span>
               {/if}
             </div>
@@ -896,6 +953,130 @@
               <span class="integration-muted">Loading integration status...</span>
             {:else if integrationError}
               <span class="integration-error">{integrationError}</span>
+            {:else if component === "nullclaw"}
+              <div class="integration-block">
+                <span class="integration-title">Observer</span>
+                {#if linkedWatch}
+                  <span class="mono">{linkedWatch.name}:{linkedWatch.port}</span>
+                {:else if currentTelemetryLink}
+                  <span class="integration-muted mono">{currentTelemetryLink.endpoint}</span>
+                {:else}
+                  <span class="integration-muted">No NullWatch linked yet.</span>
+                {/if}
+              </div>
+
+              {#if currentTelemetryLink}
+                <div class="integration-block">
+                  <span class="integration-title">OTLP</span>
+                  <div class="integration-stats compact">
+                    <div>
+                      <span class="stat-label">Endpoint</span>
+                      <span class="mono">{currentTelemetryLink.endpoint}</span>
+                    </div>
+                    <div>
+                      <span class="stat-label">Service</span>
+                      <span class="mono">{currentTelemetryLink.service_name || "-"}</span>
+                    </div>
+                    <div>
+                      <span class="stat-label">Auth</span>
+                      <span>{currentTelemetryLink.auth_header ? "Bearer" : "None"}</span>
+                    </div>
+                    <div>
+                      <span class="stat-label">Source Header</span>
+                      <span>{currentTelemetryLink.source_header ? "On" : "Off"}</span>
+                    </div>
+                  </div>
+                </div>
+              {/if}
+
+              {#if watchOptions.length > 0}
+                <div class="integration-form">
+                  <label class="integration-field">
+                    <span>Local observer</span>
+                    <select bind:value={selectedWatch} disabled={linkingIntegration}>
+                      <option value="">Select NullWatch</option>
+                      {#each watchOptions as watch}
+                        <option value={watch.name}>
+                          {watch.name} ({watch.port}){watch.running ? "" : " - stopped"}
+                        </option>
+                      {/each}
+                    </select>
+                  </label>
+                  <button
+                    class="btn integration-btn"
+                    onclick={linkNullWatch}
+                    disabled={linkingIntegration || !selectedWatch}
+                  >
+                    {linkingIntegration
+                      ? "Linking..."
+                      : linkedWatch
+                        ? "Relink NullWatch"
+                        : "Link NullWatch"}
+                  </button>
+                  {#if linkedWatch}
+                    <a
+                      class="btn integration-btn"
+                      href={`/observability?watch=${encodeURIComponent(linkedWatch.name)}`}
+                      >Open Observability</a
+                    >
+                  {/if}
+                </div>
+              {:else}
+                <span class="integration-muted">Install NullWatch to link telemetry.</span>
+              {/if}
+            {:else if component === "nullwatch"}
+              <div class="integration-block">
+                <span class="integration-title">Linked NullClaws</span>
+                {#if linkedClaws.length > 0}
+                  <div class="integration-list">
+                    {#each linkedClaws as claw}
+                      <div class="integration-list-item">
+                        <div>
+                          <span class="integration-title">{claw.name}</span>
+                          <span class="integration-muted"
+                            >{claw.running ? "running" : "stopped"}</span
+                          >
+                        </div>
+                        <a class="btn integration-btn" href={`/instances/nullclaw/${encodeURIComponent(claw.name)}`}
+                          >Open</a
+                        >
+                      </div>
+                    {/each}
+                  </div>
+                {:else}
+                  <span class="integration-muted">No NullClaw instances linked yet.</span>
+                {/if}
+              </div>
+
+              {#if clawOptions.length > 0}
+                <div class="integration-form">
+                  <label class="integration-field">
+                    <span>Local NullClaw</span>
+                    <select bind:value={selectedClaw} disabled={linkingIntegration}>
+                      <option value="">Select NullClaw</option>
+                      {#each clawOptions as claw}
+                        <option value={claw.name}>
+                          {claw.name}{claw.linked ? " - linked" : ""}{claw.running ? "" : " - stopped"}
+                        </option>
+                      {/each}
+                    </select>
+                  </label>
+                  <button
+                    class="btn integration-btn"
+                    onclick={linkNullClawToWatch}
+                    disabled={linkingIntegration || !selectedClaw}
+                  >
+                    {linkingIntegration ? "Linking..." : "Link NullClaw"}
+                  </button>
+                  <a
+                    class="btn integration-btn"
+                    href={`/observability?watch=${encodeURIComponent(name)}`}
+                    >Open Observability</a
+                  >
+                </div>
+              {:else}
+                <span class="integration-muted">Install NullClaw to send telemetry here.</span>
+              {/if}
             {:else if component === "nullboiler"}
               <div class="integration-block">
                 <span class="integration-title">Tracker</span>
