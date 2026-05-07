@@ -13,7 +13,7 @@
   let currentPath = $derived($page.url.pathname);
   let showBoilerOrchestration = $derived(Boolean(installedComponents["nullboiler"]?.installed));
   let showTicketsStore = $derived(Boolean(installedComponents["nulltickets"]?.installed));
-  let showStore = $derived(showBoilerOrchestration || showTicketsStore);
+  let showOrchestration = $derived(showBoilerOrchestration || showTicketsStore);
   let boilerSelectionVersion = $state(0);
   let ticketsSelectionVersion = $state(0);
   let orchestrationDashboardHref = $derived.by(() => {
@@ -101,7 +101,7 @@
     {/each}
   </div>
 
-  {#if showStore}
+  {#if showOrchestration}
     <div class="nav-section">
       <h3>Orchestration</h3>
       {#if showBoilerOrchestration}
@@ -109,7 +109,7 @@
         <a href={orchestrationWorkflowsHref} class:active={currentPath.startsWith(routePath(orchestrationWorkflowsHref))}>Workflows</a>
         <a href={orchestrationRunsHref} class:active={currentPath.startsWith(routePath(orchestrationRunsHref))}>Runs</a>
       {/if}
-      {#if showStore}
+      {#if showTicketsStore}
         <a href={orchestrationStoreHref} class:active={currentPath.startsWith(routePath(orchestrationStoreHref))}>Store</a>
       {/if}
     </div>

@@ -18,6 +18,8 @@
     withTicketsInstance,
   } from "$lib/orchestration/routes";
   import {
+    getSelectedBoilerInstance,
+    getSelectedTicketsInstance,
     setSelectedBoilerInstance,
     setSelectedTicketsInstance,
   } from "$lib/orchestration/backendSelection";
@@ -963,6 +965,19 @@
       loading = false;
     }
   }
+  function clearDeletedInstanceSelection() {
+    if (component === "nullboiler" && getSelectedBoilerInstance() === name) {
+      setSelectedBoilerInstance("");
+    }
+    if (component === "nulltickets" && getSelectedTicketsInstance() === name) {
+      setSelectedTicketsInstance("");
+    }
+  }
+  async function deleteInstanceAndLeave(force = false) {
+    await api.deleteInstance(component, name, force ? { force: true } : undefined);
+    clearDeletedInstanceSelection();
+    await goto("/");
+  }
   function formatDeleteDependents(body: any): string {
     const dependents = Array.isArray(body?.dependents) ? body.dependents : [];
     if (dependents.length === 0) return "linked instances";
@@ -977,8 +992,7 @@
     if (confirm("Are you sure you want to delete this instance?")) {
       loading = true;
       try {
-        await api.deleteInstance(component, name);
-        await goto("/");
+        await deleteInstanceAndLeave();
       } catch (e) {
         const error = e as ApiRequestError;
         if (error.status === 409 && error.body?.force_required) {
@@ -989,8 +1003,7 @@
             )
           ) {
             try {
-              await api.deleteInstance(component, name, { force: true });
-              await goto("/");
+              await deleteInstanceAndLeave(true);
             } catch (forceError) {
               console.error(forceError);
             }
@@ -1200,7 +1213,7 @@
                     ? "NullTickets Link"
                     : "Linked NullBoilers"}</span
               >
-              {#if (component === "nullboiler" && integration?.linked_tracker) || (component === "nullclaw" && linkedWatch) || (component === "nullwatch" && linkedClaws.length > 0)}
+              {#if (component === "nullboiler" && integration?.linked_tracker) || (component === "nullclaw" && linkedWatch) || (component === "nullwatch" && linkedClaws.length > 0) || (component === "nulltickets" && linkedBoilers.length > 0)}
                 <span class="integration-badge">Linked</span>
               {/if}
             </div>
