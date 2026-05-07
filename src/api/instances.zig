@@ -5,6 +5,8 @@ const state_mod = @import("../core/state.zig");
 const manager_mod = @import("../supervisor/manager.zig");
 const paths_mod = @import("../core/paths.zig");
 const registry = @import("../installer/registry.zig");
+const downloader = @import("../installer/downloader.zig");
+const platform = @import("../core/platform.zig");
 const helpers = @import("helpers.zig");
 const local_binary = @import("../core/local_binary.zig");
 const component_cli = @import("../core/component_cli.zig");
@@ -3108,9 +3110,70 @@ fn hideInstanceDirForDelete(allocator: std.mem.Allocator, inst_dir: []const u8) 
     return error.PathAlreadyExists;
 }
 
+fn findInstalledBinaryVersion(allocator: std.mem.Allocator, paths: paths_mod.Paths, component: []const u8) ?[]const u8 {
+    const bin_dir = std.fmt.allocPrint(allocator, "{s}/bin", .{paths.root}) catch return null;
+    defer allocator.free(bin_dir);
+
+    var dir = std_compat.fs.openDirAbsolute(bin_dir, .{ .iterate = true }) catch return null;
+    defer dir.close();
+
+    const prefix = std.fmt.allocPrint(allocator, "{s}-", .{component}) catch return null;
+    defer allocator.free(prefix);
+
+    var best_version: ?[]const u8 = null;
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+
+        var version = entry.name[prefix.len..];
+        if (builtin.os.tag == .windows and std.mem.endsWith(u8, version, ".exe")) {
+            version = version[0 .. version.len - 4];
+        }
+        if (version.len == 0) continue;
+
+        const candidate_path = std.fs.path.join(allocator, &.{ bin_dir, entry.name }) catch continue;
+        defer allocator.free(candidate_path);
+        std_compat.fs.accessAbsolute(candidate_path, .{}) catch continue;
+
+        if (best_version == null or std.mem.order(u8, version, best_version.?) == .gt) {
+            const owned_version = allocator.dupe(u8, version) catch continue;
+            if (best_version) |owned| allocator.free(owned);
+            best_version = owned_version;
+        }
+    }
+
+    return best_version;
+}
+
+fn downloadLatestBinaryVersion(allocator: std.mem.Allocator, paths: paths_mod.Paths, component: []const u8) ?[]const u8 {
+    const known = registry.findKnownComponent(component) orelse return null;
+    var release = registry.fetchLatestRelease(allocator, known.repo) catch return null;
+    defer release.deinit();
+
+    const platform_key = comptime platform.detect().toString();
+    const asset = registry.findAssetForComponentPlatform(allocator, release.value, component, platform_key) orelse return null;
+
+    paths.ensureDirs() catch return null;
+    const bin_path = paths.binary(allocator, component, release.value.tag_name) catch return null;
+    defer allocator.free(bin_path);
+
+    downloader.downloadIfMissing(allocator, asset.browser_download_url, bin_path) catch return null;
+    return allocator.dupe(u8, release.value.tag_name) catch null;
+}
+
+fn resolveImportBinaryVersion(allocator: std.mem.Allocator, paths: paths_mod.Paths, component: []const u8) ?[]const u8 {
+    if (local_binary.stageDevLocal(allocator, paths, component)) |dest_bin| {
+        allocator.free(dest_bin);
+        return allocator.dupe(u8, local_binary.dev_local_version) catch null;
+    }
+    if (findInstalledBinaryVersion(allocator, paths, component)) |version| return version;
+    return downloadLatestBinaryVersion(allocator, paths, component);
+}
+
 /// POST /api/instances/{component}/import — import a standalone installation.
 /// Copies config and data from ~/.{component}/ into the nullhub instance directory.
-/// The binary will be downloaded via the normal install flow on first start.
+/// A runnable binary is staged during import so the managed instance can start.
 pub fn handleImport(allocator: std.mem.Allocator, s: *state_mod.State, paths: paths_mod.Paths, component: []const u8) ApiResponse {
     const home = std_compat.process.getEnvVarOwned(allocator, "HOME") catch blk: {
         if (builtin.os.tag == .windows) {
@@ -3137,21 +3200,16 @@ pub fn handleImport(allocator: std.mem.Allocator, s: *state_mod.State, paths: pa
         else => return helpers.serverError(),
     };
 
-    // 3. Symlink the entire standalone dir as the instance dir
+    // 3. Stage or reuse a runnable binary before mutating the instance path.
+    const version = resolveImportBinaryVersion(allocator, paths, component) orelse return helpers.serverError();
+    defer allocator.free(version);
+
+    // 4. Symlink the entire standalone dir as the instance dir
     //    ~/.nullclaw → ~/.nullhub/instances/nullclaw/default
     //    This preserves all data in place (config, auth, workspace, state, logs)
     std_compat.fs.deleteFileAbsolute(inst_dir) catch {};
     std_compat.fs.deleteTreeAbsolute(inst_dir) catch {};
     std_compat.fs.symLinkAbsolute(dot_dir, inst_dir, .{ .is_directory = true }) catch return helpers.serverError();
-
-    // 4. Stage binary from local dev build or leave for download on start.
-    const version = blk: {
-        if (local_binary.stageDevLocal(allocator, paths, component)) |dest_bin| {
-            allocator.free(dest_bin);
-            break :blk local_binary.dev_local_version;
-        }
-        break :blk "standalone";
-    };
 
     // 5. Register in state
     const default_launch_mode = if (registry.findKnownComponent(component)) |known|
@@ -3400,18 +3458,35 @@ fn handleIntegrationPost(
         else
             null;
         if (pipeline_id == null) return badRequest("{\"error\":\"pipeline_id is required\"}");
-        const cfg = integration_mod.loadNullTicketsConfig(allocator, paths, tracker_name.?) catch null orelse return notFound();
+        var cfg = integration_mod.loadNullTicketsConfig(allocator, paths, tracker_name.?) catch null orelse return notFound();
+        const pipeline_id_owned = allocator.dupe(u8, pipeline_id.?) catch {
+            integration_mod.deinitNullTicketsConfig(allocator, &cfg);
+            return helpers.serverError();
+        };
+        const claim_role_raw = if (parsed.value.object.get("claim_role")) |value|
+            if (value == .string and value.string.len > 0) value.string else "coder"
+        else
+            "coder";
+        const claim_role_owned = allocator.dupe(u8, claim_role_raw) catch {
+            allocator.free(pipeline_id_owned);
+            integration_mod.deinitNullTicketsConfig(allocator, &cfg);
+            return helpers.serverError();
+        };
+        const success_trigger_raw = if (parsed.value.object.get("success_trigger")) |value|
+            if (value == .string and value.string.len > 0) value.string else "complete"
+        else
+            "complete";
+        const success_trigger_owned = allocator.dupe(u8, success_trigger_raw) catch {
+            allocator.free(claim_role_owned);
+            allocator.free(pipeline_id_owned);
+            integration_mod.deinitNullTicketsConfig(allocator, &cfg);
+            return helpers.serverError();
+        };
         break :blk .{
             .tickets = cfg,
-            .pipeline_id = pipeline_id.?,
-            .claim_role = if (parsed.value.object.get("claim_role")) |value|
-                if (value == .string and value.string.len > 0) value.string else "coder"
-            else
-                "coder",
-            .success_trigger = if (parsed.value.object.get("success_trigger")) |value|
-                if (value == .string and value.string.len > 0) value.string else "complete"
-            else
-                "complete",
+            .pipeline_id = pipeline_id_owned,
+            .claim_role = claim_role_owned,
+            .success_trigger = success_trigger_owned,
             .max_concurrent_tasks = if (parsed.value.object.get("max_concurrent_tasks")) |value|
                 switch (value) {
                     .integer => if (value.integer > 0 and value.integer <= std.math.maxInt(u32)) @as(?u32, @intCast(value.integer)) else null,
@@ -3423,6 +3498,9 @@ fn handleIntegrationPost(
         };
     };
     defer {
+        allocator.free(tracker_cfg.success_trigger);
+        allocator.free(tracker_cfg.claim_role);
+        allocator.free(tracker_cfg.pipeline_id);
         var owned_cfg = tracker_cfg.tickets;
         integration_mod.deinitNullTicketsConfig(allocator, &owned_cfg);
     }
@@ -3470,6 +3548,7 @@ fn handleIntegrationPost(
 
     const tracker_map = ensureObjectField(allocator, &parsed_config.value.object, "tracker") catch return helpers.serverError();
     const tracker_url = std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{tracker_cfg.tickets.port}) catch return helpers.serverError();
+    defer allocator.free(tracker_url);
     tracker_map.put(allocator, "url", .{ .string = tracker_url }) catch return helpers.serverError();
     if (tracker_cfg.tickets.api_token) |token| {
         tracker_map.put(allocator, "api_token", .{ .string = token }) catch return helpers.serverError();
@@ -3567,8 +3646,11 @@ fn ensureTrackerWorkflowFile(
     const workflow_path = try std.fs.path.join(allocator, &.{ workflows_dir, integration_mod.managed_workflow_file_name });
     defer allocator.free(workflow_path);
 
+    const workflow_id = try std.fmt.allocPrint(allocator, "wf-{s}-{s}", .{ pipeline_id, claim_role });
+    defer allocator.free(workflow_id);
+
     const rendered = try std.json.Stringify.valueAlloc(allocator, .{
-        .id = try std.fmt.allocPrint(allocator, "wf-{s}-{s}", .{ pipeline_id, claim_role }),
+        .id = workflow_id,
         .pipeline_id = pipeline_id,
         .claim_roles = &.{claim_role},
         .execution = "subprocess",

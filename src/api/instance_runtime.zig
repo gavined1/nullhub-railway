@@ -62,8 +62,13 @@ fn isImportedStandalone(
     name: []const u8,
     entry: state_mod.InstanceEntry,
 ) bool {
-    if (!std.mem.eql(u8, component, "nullclaw")) return false;
-    if (!std.mem.eql(u8, entry.launch_mode, "gateway")) return false;
+    if (std.mem.eql(u8, component, "nullclaw")) {
+        if (!std.mem.eql(u8, entry.launch_mode, "gateway")) return false;
+    } else if (std.mem.eql(u8, component, "nullboiler") or std.mem.eql(u8, component, "nulltickets")) {
+        if (!std.mem.eql(u8, entry.launch_mode, "server")) return false;
+    } else {
+        return false;
+    }
 
     const inst_dir = paths.instanceDir(allocator, component, name) catch return false;
     defer allocator.free(inst_dir);
@@ -102,7 +107,11 @@ fn deriveImportedStandaloneSnapshot(
 ) ?Snapshot {
     if (!isImportedStandalone(allocator, paths, component, name, entry)) return null;
 
-    const port = readPortFromConfig(allocator, paths, component, name, "gateway.port") orelse return null;
+    const primary_port_key = if (std.mem.eql(u8, component, "nullclaw")) "gateway.port" else "port";
+    const port = readPortFromConfig(allocator, paths, component, name, primary_port_key) orelse
+        readPortFromConfig(allocator, paths, component, name, "gateway.port") orelse
+        readPortFromConfig(allocator, paths, component, name, "port") orelse
+        return null;
     if (port == 0) return null;
 
     const health = health_mod.check(allocator, "127.0.0.1", port, "/health");

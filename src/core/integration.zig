@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const paths_mod = @import("paths.zig");
 const state_mod = @import("state.zig");
+const test_helpers = @import("../test_helpers.zig");
 
 pub const NullTicketsConfig = struct {
     name: []const u8,
@@ -116,7 +117,7 @@ pub fn loadNullBoilerConfig(allocator: std.mem.Allocator, paths: paths_mod.Paths
             const workflows_dir = try resolveRelativePath(allocator, config_dir, tracker.workflows_dir);
             const workflow = try loadPrimaryWorkflowConfig(allocator, workflows_dir);
             break :blk .{
-                .url = try allocator.dupe(u8, tracker.url),
+                .url = try allocator.dupe(u8, tracker.url orelse ""),
                 .api_token = if (tracker.api_token) |token| try allocator.dupe(u8, token) else null,
                 .agent_id = try allocator.dupe(u8, tracker.agent_id),
                 .workflows_dir = workflows_dir,
@@ -263,7 +264,7 @@ const NullBoilerConfigFile = struct {
     port: u16 = 8080,
     api_token: ?[]const u8 = null,
     tracker: ?struct {
-        url: []const u8,
+        url: ?[]const u8 = null,
         api_token: ?[]const u8 = null,
         agent_id: []const u8 = "nullboiler",
         concurrency: struct {
@@ -280,3 +281,28 @@ const WorkflowFile = struct {
         transition_to: []const u8 = "",
     } = null,
 };
+
+test "loadNullBoilerConfig accepts tracker without url" {
+    const allocator = std.testing.allocator;
+    var fixture = try test_helpers.TempPaths.init(allocator);
+    defer fixture.deinit();
+    try fixture.paths.ensureDirs();
+
+    const inst_dir = try fixture.paths.instanceDir(allocator, "nullboiler", "worker-a");
+    defer allocator.free(inst_dir);
+    try std.fs.makePathAbsolute(inst_dir);
+
+    const config_path = try fixture.paths.instanceConfig(allocator, "nullboiler", "worker-a");
+    defer allocator.free(config_path);
+    const file = try std_compat.fs.createFileAbsolute(config_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("{\"port\":8811,\"tracker\":{\"agent_id\":\"worker-a\"}}\n");
+
+    var cfg = (try loadNullBoilerConfig(allocator, fixture.paths, "worker-a")).?;
+    defer deinitNullBoilerConfig(allocator, &cfg);
+
+    try std.testing.expectEqual(@as(u16, 8811), cfg.port);
+    try std.testing.expect(cfg.tracker != null);
+    try std.testing.expectEqualStrings("", cfg.tracker.?.url);
+    try std.testing.expectEqualStrings("worker-a", cfg.tracker.?.agent_id);
+}

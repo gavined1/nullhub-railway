@@ -25,6 +25,7 @@ const usage_api = @import("api/usage.zig");
 const report_api = @import("api/report.zig");
 const orchestration_api = @import("api/orchestration.zig");
 const launch_args_mod = @import("core/launch_args.zig");
+const integration_mod = @import("core/integration.zig");
 const ui_modules = @import("installer/ui_modules.zig");
 const orchestrator = @import("installer/orchestrator.zig");
 const registry = @import("installer/registry.zig");
@@ -551,6 +552,64 @@ pub const Server = struct {
     fn getTicketsToken(self: *Server) ?[]const u8 {
         _ = self;
         return getEnv("NULLTICKETS_TOKEN");
+    }
+
+    const ManagedBackendConfig = struct {
+        url: []u8,
+        token: ?[]u8 = null,
+
+        fn deinit(self: *ManagedBackendConfig, allocator: std.mem.Allocator) void {
+            allocator.free(self.url);
+            if (self.token) |token| allocator.free(token);
+            self.* = undefined;
+        }
+    };
+
+    fn resolveManagedBackend(self: *Server, allocator: std.mem.Allocator, component: []const u8) ?ManagedBackendConfig {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (std.mem.eql(u8, component, "nullboiler")) {
+            const configs = integration_mod.listNullBoilers(allocator, self.state, self.paths) catch return null;
+            defer integration_mod.deinitNullBoilerConfigs(allocator, configs);
+            if (configs.len == 0) return null;
+
+            const selected = self.selectManagedBackendIndex("nullboiler", configs);
+            return managedBackendFromConfig(allocator, configs[selected].port, configs[selected].api_token);
+        }
+
+        if (std.mem.eql(u8, component, "nulltickets")) {
+            const configs = integration_mod.listNullTickets(allocator, self.state, self.paths) catch return null;
+            defer integration_mod.deinitNullTicketsConfigs(allocator, configs);
+            if (configs.len == 0) return null;
+
+            const selected = self.selectManagedBackendIndex("nulltickets", configs);
+            return managedBackendFromConfig(allocator, configs[selected].port, configs[selected].api_token);
+        }
+
+        return null;
+    }
+
+    fn selectManagedBackendIndex(self: *Server, component: []const u8, configs: anytype) usize {
+        var fallback: usize = 0;
+        for (configs, 0..) |cfg, idx| {
+            if (std.mem.eql(u8, cfg.name, "default")) fallback = idx;
+            const status = self.manager.getStatus(component, cfg.name) orelse continue;
+            if (status.status == .running) return idx;
+        }
+        return fallback;
+    }
+
+    fn managedBackendFromConfig(allocator: std.mem.Allocator, port: u16, token: ?[]const u8) ?ManagedBackendConfig {
+        const url = std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port}) catch return null;
+        const owned_token = if (token) |value| allocator.dupe(u8, value) catch {
+            allocator.free(url);
+            return null;
+        } else null;
+        return .{
+            .url = url,
+            .token = owned_token,
+        };
     }
 
     fn routeWithoutServerMutex(target: []const u8) bool {
@@ -1123,11 +1182,21 @@ pub const Server = struct {
         }
 
         if (orchestration_api.isProxyPath(target)) {
+            const env_boiler_url = self.getBoilerUrl();
+            const env_boiler_token = self.getBoilerToken();
+            const env_tickets_url = self.getTicketsUrl();
+            const env_tickets_token = self.getTicketsToken();
+
+            var managed_boiler = if (env_boiler_url == null) self.resolveManagedBackend(allocator, "nullboiler") else null;
+            defer if (managed_boiler) |*cfg| cfg.deinit(allocator);
+            var managed_tickets = if (env_tickets_url == null) self.resolveManagedBackend(allocator, "nulltickets") else null;
+            defer if (managed_tickets) |*cfg| cfg.deinit(allocator);
+
             const resp = orchestration_api.handle(allocator, method, target, body, .{
-                .boiler_url = self.getBoilerUrl(),
-                .boiler_token = self.getBoilerToken(),
-                .tickets_url = self.getTicketsUrl(),
-                .tickets_token = self.getTicketsToken(),
+                .boiler_url = env_boiler_url orelse if (managed_boiler) |cfg| cfg.url else null,
+                .boiler_token = env_boiler_token orelse if (managed_boiler) |cfg| cfg.token else null,
+                .tickets_url = env_tickets_url orelse if (managed_tickets) |cfg| cfg.url else null,
+                .tickets_token = env_tickets_token orelse if (managed_tickets) |cfg| cfg.token else null,
             });
             return .{ .status = resp.status, .content_type = resp.content_type, .body = resp.body };
         }

@@ -350,7 +350,7 @@ fn prepareWizardBody(
 ) ?[]const u8 {
     if (!std.mem.eql(u8, component_name, "nullboiler")) return null;
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return null;
@@ -366,8 +366,9 @@ fn prepareWizardBody(
     var tracker_cfg = (integration_mod.loadNullTicketsConfig(allocator, paths, tracker_instance.?) catch return null) orelse return null;
     defer integration_mod.deinitNullTicketsConfig(allocator, &tracker_cfg);
 
-    var root = parsed.value.object;
+    var root = &parsed.value.object;
     const tracker_url = std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{tracker_cfg.port}) catch return null;
+    defer allocator.free(tracker_url);
     root.put(allocator, "tracker_enabled", .{ .string = "true" }) catch return null;
     root.put(allocator, "tracker_url", .{ .string = tracker_url }) catch return null;
     if (tracker_cfg.api_token) |token| {
