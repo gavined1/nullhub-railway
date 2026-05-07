@@ -214,8 +214,9 @@
   }
 
   function formatDuration(run: Run | null | undefined): string {
-    if (!run?.created_at) return "-";
-    const start = Date.parse(run.created_at);
+    const startValue = run?.started_at || run?.created_at;
+    if (!startValue) return "-";
+    const start = Date.parse(startValue);
     if (!Number.isFinite(start)) return "-";
     const end = run.completed_at ? Date.parse(run.completed_at) : Date.now();
     const seconds = Math.max(0, Math.floor((end - start) / 1000));
@@ -604,8 +605,11 @@
         selectedRunWorkflow = data.workflow;
       } else if (data?.workflow_id) {
         try {
-          selectedRunWorkflow = await api.getWorkflow(data.workflow_id, boilerOptions());
+          const workflow = await api.getWorkflow(data.workflow_id, boilerOptions());
+          if (requestSeq !== runDetailRequestSeq) return;
+          selectedRunWorkflow = workflow;
         } catch {
+          if (requestSeq !== runDetailRequestSeq) return;
           selectedRunWorkflow = { nodes: {}, edges: [] };
         }
       } else {

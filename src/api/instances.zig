@@ -709,13 +709,13 @@ fn fetchPipelineSummaries(allocator: std.mem.Allocator, url: []const u8, bearer_
         .ignore_unknown_fields = true,
     }) catch return null;
     defer parsed.deinit();
-    if (parsed.value != .array) return null;
+    const pipeline_items = pipelineItemsFromValue(parsed.value) orelse return null;
 
     var list: std.ArrayListUnmanaged(PipelineSummary) = .empty;
     errdefer deinitPipelineSummaries(allocator, list.items);
     defer list.deinit(allocator);
 
-    for (parsed.value.array.items) |item| {
+    for (pipeline_items) |item| {
         const summary = parsePipelineSummary(allocator, item) catch continue;
         list.append(allocator, summary) catch {
             deinitPipelineSummary(allocator, summary);
@@ -726,17 +726,61 @@ fn fetchPipelineSummaries(allocator: std.mem.Allocator, url: []const u8, bearer_
     return list.toOwnedSlice(allocator) catch null;
 }
 
+fn pipelineItemsFromValue(value: std.json.Value) ?[]const std.json.Value {
+    return switch (value) {
+        .array => |array| array.items,
+        .object => |object| blk: {
+            if (object.get("pipelines")) |pipelines| {
+                if (pipelines == .array) break :blk pipelines.array.items;
+            }
+            if (object.get("items")) |items| {
+                if (items == .array) break :blk items.array.items;
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
 fn parsePipelineSummary(allocator: std.mem.Allocator, value: std.json.Value) !PipelineSummary {
     if (value != .object) return error.InvalidPipelineSummary;
     const obj = value.object;
-    const definition = obj.get("definition") orelse return error.InvalidPipelineSummary;
-    if (definition != .object) return error.InvalidPipelineSummary;
+    var parsed_definition: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_definition) |*parsed| parsed.deinit();
+    const definition = try pipelineDefinitionValue(
+        allocator,
+        obj.get("definition") orelse obj.get("definition_json") orelse return error.InvalidPipelineSummary,
+        &parsed_definition,
+    );
 
-    return .{
-        .id = try allocator.dupe(u8, jsonStringOrEmpty(obj, "id")),
-        .name = try allocator.dupe(u8, jsonStringOrEmpty(obj, "name")),
-        .roles = try collectPipelineRoles(allocator, definition),
-        .triggers = try collectPipelineTriggers(allocator, definition),
+    const id = try allocator.dupe(u8, jsonStringOrEmpty(obj, "id"));
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, jsonStringOrEmpty(obj, "name"));
+    errdefer allocator.free(name);
+    const roles = try collectPipelineRoles(allocator, definition);
+    errdefer freeStringList(allocator, roles);
+    const triggers = try collectPipelineTriggers(allocator, definition);
+
+    return .{ .id = id, .name = name, .roles = roles, .triggers = triggers };
+}
+
+fn pipelineDefinitionValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    parsed_out: *?std.json.Parsed(std.json.Value),
+) !std.json.Value {
+    return switch (value) {
+        .object => value,
+        .string => |raw| blk: {
+            parsed_out.* = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            });
+            const parsed = &parsed_out.*.?;
+            if (parsed.value != .object) return error.InvalidPipelineSummary;
+            break :blk parsed.value;
+        },
+        else => error.InvalidPipelineSummary,
     };
 }
 
@@ -746,6 +790,7 @@ fn collectPipelineRoles(allocator: std.mem.Allocator, definition: std.json.Value
     if (states_val != .object) return allocator.alloc([]const u8, 0);
 
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer for (list.items) |role| allocator.free(role);
     defer list.deinit(allocator);
 
     var it = states_val.object.iterator();
@@ -764,6 +809,7 @@ fn collectPipelineTriggers(allocator: std.mem.Allocator, definition: std.json.Va
     if (transitions_val != .array) return allocator.alloc([]const u8, 0);
 
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer for (list.items) |trigger| allocator.free(trigger);
     defer list.deinit(allocator);
 
     for (transitions_val.array.items) |transition| {
@@ -779,16 +825,21 @@ fn appendUniqueString(allocator: std.mem.Allocator, list: *std.ArrayListUnmanage
     for (list.items) |existing| {
         if (std.mem.eql(u8, existing, value)) return;
     }
-    try list.append(allocator, try allocator.dupe(u8, value));
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try list.append(allocator, owned);
+}
+
+fn freeStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(@constCast(values));
 }
 
 fn deinitPipelineSummary(allocator: std.mem.Allocator, summary: PipelineSummary) void {
     allocator.free(summary.id);
     allocator.free(summary.name);
-    for (summary.roles) |role| allocator.free(role);
-    allocator.free(summary.roles);
-    for (summary.triggers) |trigger| allocator.free(trigger);
-    allocator.free(summary.triggers);
+    freeStringList(allocator, summary.roles);
+    freeStringList(allocator, summary.triggers);
 }
 
 fn deinitPipelineSummaries(allocator: std.mem.Allocator, summaries: []const PipelineSummary) void {
@@ -4029,6 +4080,81 @@ fn linkNullClawTelemetry(
     return jsonOk("{\"status\":\"linked\"}");
 }
 
+const NullBoilerLinkRequest = struct {
+    tickets: integration_mod.NullTicketsConfig,
+    pipeline_id: []const u8,
+    claim_role: []const u8,
+    success_trigger: []const u8,
+    max_concurrent_tasks: ?u32 = null,
+
+    fn deinit(self: *NullBoilerLinkRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.success_trigger);
+        allocator.free(self.claim_role);
+        allocator.free(self.pipeline_id);
+        integration_mod.deinitNullTicketsConfig(allocator, &self.tickets);
+        self.* = undefined;
+    }
+};
+
+const NullBoilerLinkRequestError = error{
+    InvalidJson,
+    TrackerInstanceRequired,
+    PipelineIdRequired,
+    TrackerNotFound,
+    OutOfMemory,
+};
+
+fn parseNullBoilerLinkRequest(
+    allocator: std.mem.Allocator,
+    paths: paths_mod.Paths,
+    body: []const u8,
+) NullBoilerLinkRequestError!NullBoilerLinkRequest {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidJson;
+
+    const obj = parsed.value.object;
+    const tracker_name = jsonString(obj, "tracker_instance") orelse return error.TrackerInstanceRequired;
+    if (tracker_name.len == 0) return error.TrackerInstanceRequired;
+    const pipeline_id = jsonString(obj, "pipeline_id") orelse return error.PipelineIdRequired;
+    if (pipeline_id.len == 0) return error.PipelineIdRequired;
+
+    var tickets = (integration_mod.loadNullTicketsConfig(allocator, paths, tracker_name) catch null) orelse
+        return error.TrackerNotFound;
+    errdefer integration_mod.deinitNullTicketsConfig(allocator, &tickets);
+
+    const pipeline_id_owned = try allocator.dupe(u8, pipeline_id);
+    errdefer allocator.free(pipeline_id_owned);
+    const claim_role = try allocator.dupe(u8, nonEmptyJsonStringOrDefault(obj, "claim_role", "coder"));
+    errdefer allocator.free(claim_role);
+    const success_trigger = try allocator.dupe(u8, nonEmptyJsonStringOrDefault(obj, "success_trigger", "complete"));
+
+    return .{
+        .tickets = tickets,
+        .pipeline_id = pipeline_id_owned,
+        .claim_role = claim_role,
+        .success_trigger = success_trigger,
+        .max_concurrent_tasks = parseOptionalPositiveU32(obj.get("max_concurrent_tasks")),
+    };
+}
+
+fn nonEmptyJsonStringOrDefault(obj: std.json.ObjectMap, key: []const u8, default_value: []const u8) []const u8 {
+    const value = jsonString(obj, key) orelse return default_value;
+    return if (value.len > 0) value else default_value;
+}
+
+fn parseOptionalPositiveU32(value: ?std.json.Value) ?u32 {
+    const raw = value orelse return null;
+    return switch (raw) {
+        .integer => if (raw.integer > 0 and raw.integer <= std.math.maxInt(u32)) @as(?u32, @intCast(raw.integer)) else null,
+        .string => std.fmt.parseInt(u32, raw.string, 10) catch null,
+        else => null,
+    };
+}
+
 fn handleIntegrationPost(
     allocator: std.mem.Allocator,
     s: *state_mod.State,
@@ -4086,69 +4212,14 @@ fn handleIntegrationPost(
 
     if (!std.mem.eql(u8, component, "nullboiler")) return badRequest("{\"error\":\"integration updates are only supported for nullclaw, nullwatch, and nullboiler\"}");
 
-    const tracker_cfg = blk: {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        }) catch return badRequest("{\"error\":\"invalid JSON body\"}");
-        defer parsed.deinit();
-        if (parsed.value != .object) return badRequest("{\"error\":\"invalid JSON body\"}");
-        const tracker_name = if (parsed.value.object.get("tracker_instance")) |value|
-            if (value == .string and value.string.len > 0) value.string else null
-        else
-            null;
-        if (tracker_name == null) return badRequest("{\"error\":\"tracker_instance is required\"}");
-        const pipeline_id = if (parsed.value.object.get("pipeline_id")) |value|
-            if (value == .string and value.string.len > 0) value.string else null
-        else
-            null;
-        if (pipeline_id == null) return badRequest("{\"error\":\"pipeline_id is required\"}");
-        var cfg = integration_mod.loadNullTicketsConfig(allocator, paths, tracker_name.?) catch null orelse return notFound();
-        const pipeline_id_owned = allocator.dupe(u8, pipeline_id.?) catch {
-            integration_mod.deinitNullTicketsConfig(allocator, &cfg);
-            return helpers.serverError();
-        };
-        const claim_role_raw = if (parsed.value.object.get("claim_role")) |value|
-            if (value == .string and value.string.len > 0) value.string else "coder"
-        else
-            "coder";
-        const claim_role_owned = allocator.dupe(u8, claim_role_raw) catch {
-            allocator.free(pipeline_id_owned);
-            integration_mod.deinitNullTicketsConfig(allocator, &cfg);
-            return helpers.serverError();
-        };
-        const success_trigger_raw = if (parsed.value.object.get("success_trigger")) |value|
-            if (value == .string and value.string.len > 0) value.string else "complete"
-        else
-            "complete";
-        const success_trigger_owned = allocator.dupe(u8, success_trigger_raw) catch {
-            allocator.free(claim_role_owned);
-            allocator.free(pipeline_id_owned);
-            integration_mod.deinitNullTicketsConfig(allocator, &cfg);
-            return helpers.serverError();
-        };
-        break :blk .{
-            .tickets = cfg,
-            .pipeline_id = pipeline_id_owned,
-            .claim_role = claim_role_owned,
-            .success_trigger = success_trigger_owned,
-            .max_concurrent_tasks = if (parsed.value.object.get("max_concurrent_tasks")) |value|
-                switch (value) {
-                    .integer => if (value.integer > 0 and value.integer <= std.math.maxInt(u32)) @as(?u32, @intCast(value.integer)) else null,
-                    .string => std.fmt.parseInt(u32, value.string, 10) catch null,
-                    else => null,
-                }
-            else
-                null,
-        };
+    var tracker_cfg = parseNullBoilerLinkRequest(allocator, paths, body) catch |err| switch (err) {
+        error.InvalidJson => return badRequest("{\"error\":\"invalid JSON body\"}"),
+        error.TrackerInstanceRequired => return badRequest("{\"error\":\"tracker_instance is required\"}"),
+        error.PipelineIdRequired => return badRequest("{\"error\":\"pipeline_id is required\"}"),
+        error.TrackerNotFound => return notFound(),
+        error.OutOfMemory => return helpers.serverError(),
     };
-    defer {
-        allocator.free(tracker_cfg.success_trigger);
-        allocator.free(tracker_cfg.claim_role);
-        allocator.free(tracker_cfg.pipeline_id);
-        var owned_cfg = tracker_cfg.tickets;
-        integration_mod.deinitNullTicketsConfig(allocator, &owned_cfg);
-    }
+    defer tracker_cfg.deinit(allocator);
 
     var existing = integration_mod.loadNullBoilerConfig(allocator, paths, name) catch null orelse return notFound();
     defer integration_mod.deinitNullBoilerConfig(allocator, &existing);
@@ -4575,6 +4646,36 @@ test "component default launch mode uses registry metadata" {
     try std.testing.expect(isLegacyDefaultLaunchMode("nullwatch", "gateway"));
     try std.testing.expect(!isLegacyDefaultLaunchMode("nullwatch", "serve"));
     try std.testing.expect(!isLegacyDefaultLaunchMode("nullclaw", "gateway"));
+}
+
+test "pipeline summaries accept wrapped lists and JSON string definitions" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "pipelines": [{
+        \\    "id": "pipe-dev",
+        \\    "name": "Development",
+        \\    "definition": "{\"states\":{\"claim\":{\"agent_role\":\"reviewer\"},\"build\":{\"agent_role\":\"coder\"}},\"transitions\":[{\"trigger\":\"complete\"},{\"trigger\":\"needs_review\"}]}"
+        \\  }]
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const items = pipelineItemsFromValue(parsed.value) orelse @panic("pipelines missing");
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+
+    const summary = try parsePipelineSummary(allocator, items[0]);
+    defer deinitPipelineSummary(allocator, summary);
+    try std.testing.expectEqualStrings("pipe-dev", summary.id);
+    try std.testing.expectEqualStrings("Development", summary.name);
+    try std.testing.expect(pipelineContainsString(summary.roles, "reviewer"));
+    try std.testing.expect(pipelineContainsString(summary.roles, "coder"));
+    try std.testing.expect(pipelineContainsString(summary.triggers, "complete"));
+    try std.testing.expect(pipelineContainsString(summary.triggers, "needs_review"));
 }
 
 fn writeTestInstanceConfig(
