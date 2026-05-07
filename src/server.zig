@@ -701,7 +701,15 @@ pub const Server = struct {
             }
             if (std.mem.eql(u8, method, "PUT")) {
                 if (settings_api.handlePutSettings(allocator, body)) |json| {
-                    return jsonResponse(json);
+                    const status = if (std.mem.indexOf(u8, json, "\"error\"") != null)
+                        "400 Bad Request"
+                    else
+                        "200 OK";
+                    return .{
+                        .status = status,
+                        .content_type = "application/json",
+                        .body = json,
+                    };
                 } else |_| {
                     return .{
                         .status = "500 Internal Server Error",
