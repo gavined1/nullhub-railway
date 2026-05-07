@@ -21,16 +21,12 @@ pub fn isProxyPath(target: []const u8) bool {
 }
 
 pub fn selectedWatchNameAlloc(allocator: Allocator, target: []const u8) !?[]u8 {
-    if (try query.valueAlloc(allocator, target, "nullhub_watch")) |value| return value;
-    if (try query.valueAlloc(allocator, target, "watch")) |value| return value;
-    return try query.valueAlloc(allocator, target, "instance");
+    return try query.valueAlloc(allocator, target, "nullhub_watch");
 }
 
 fn isSelectorParam(param: []const u8) bool {
     const key = if (std.mem.indexOfScalar(u8, param, '=')) |idx| param[0..idx] else param;
-    return std.mem.eql(u8, key, "nullhub_watch") or
-        std.mem.eql(u8, key, "watch") or
-        std.mem.eql(u8, key, "instance");
+    return std.mem.eql(u8, key, "nullhub_watch");
 }
 
 fn stripSelectorParamsAlloc(allocator: Allocator, target: []const u8) ![]u8 {
@@ -105,6 +101,7 @@ test "selectedWatchNameAlloc reads hub selector query params" {
     const selected = (try selectedWatchNameAlloc(allocator, "/api/observability/v1/runs?limit=1&nullhub_watch=watch+one")).?;
     defer allocator.free(selected);
     try std.testing.expectEqualStrings("watch one", selected);
+    try std.testing.expect((try selectedWatchNameAlloc(allocator, "/api/observability/v1/runs?watch=upstream")) == null);
 }
 
 test "stripSelectorParamsAlloc removes only NullHub watch selector" {
@@ -113,7 +110,11 @@ test "stripSelectorParamsAlloc removes only NullHub watch selector" {
     defer allocator.free(stripped);
     try std.testing.expectEqualStrings("/api/observability/v1/runs?limit=50&status=ok", stripped);
 
-    const root = try stripSelectorParamsAlloc(allocator, "/api/observability?watch=alpha");
+    const root = try stripSelectorParamsAlloc(allocator, "/api/observability?nullhub_watch=alpha");
     defer allocator.free(root);
     try std.testing.expectEqualStrings("/api/observability", root);
+
+    const upstream_filter = try stripSelectorParamsAlloc(allocator, "/api/observability/v1/runs?watch=alpha&instance=demo");
+    defer allocator.free(upstream_filter);
+    try std.testing.expectEqualStrings("/api/observability/v1/runs?watch=alpha&instance=demo", upstream_filter);
 }

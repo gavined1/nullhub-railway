@@ -1343,8 +1343,14 @@ pub const Server = struct {
             const selected_watch = observability_api.selectedWatchNameAlloc(allocator, target) catch
                 return .{ .status = "500 Internal Server Error", .content_type = "application/json", .body = "{\"error\":\"internal error\"}" };
             defer if (selected_watch) |value| allocator.free(value);
-            const watch_target = self.getWatchTarget(allocator, selected_watch);
+
+            const watch_target = blk: {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                break :blk self.getWatchTarget(allocator, selected_watch);
+            };
             defer watch_target.deinit(allocator);
+
             const resp = observability_api.handle(allocator, method, target, body, .{
                 .watch_url = watch_target.url,
                 .watch_token = watch_target.token,

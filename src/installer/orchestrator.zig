@@ -381,6 +381,15 @@ fn resolveConfiguredPort(
     if (requested == default_port) {
         return findNextAvailablePort(allocator, default_port, paths, state);
     }
+
+    var used_ports = collectConfiguredPorts(allocator, paths, state) catch return if (isPortFree(requested))
+        requested
+    else
+        findFreePort(requested);
+    defer used_ports.deinit();
+    if (used_ports.contains(requested) or !isPortFree(requested)) {
+        return findNextAvailablePort(allocator, requested, paths, state);
+    }
     return requested;
 }
 
@@ -1342,6 +1351,43 @@ test "resolveConfiguredPort skips configured string default port" {
 
     const port = resolveConfiguredPort(allocator, "{\"port\":\"43010\"}", 43010, fixture.paths, &state);
     try std.testing.expect(port > 43010);
+}
+
+test "resolveConfiguredPort skips configured explicit non-default port" {
+    const allocator = std.testing.allocator;
+    var fixture = try test_helpers.TempPaths.init(allocator);
+    defer fixture.deinit();
+    try fixture.paths.ensureDirs();
+
+    const state_path = try fixture.paths.state(allocator);
+    defer allocator.free(state_path);
+    var state = state_mod.State.init(allocator, state_path);
+    defer state.deinit();
+    try state.addInstance("nullwatch", "watch-1", .{
+        .version = "v2026.3.8",
+        .auto_start = true,
+        .launch_mode = "serve",
+    });
+
+    const comp_dir = try std.fs.path.join(allocator, &.{ fixture.paths.root, "instances", "nullwatch" });
+    defer allocator.free(comp_dir);
+    std_compat.fs.makeDirAbsolute(comp_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    const inst_dir = try fixture.paths.instanceDir(allocator, "nullwatch", "watch-1");
+    defer allocator.free(inst_dir);
+    std_compat.fs.makeDirAbsolute(inst_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const config_path = try fixture.paths.instanceConfig(allocator, "nullwatch", "watch-1");
+    defer allocator.free(config_path);
+    try writeFile(config_path, "{\"port\":43020}");
+
+    const port = resolveConfiguredPort(allocator, "{\"port\":43020}", 7710, fixture.paths, &state);
+    try std.testing.expect(port > 43020);
 }
 
 test "injectPortFields fills missing port fields" {
