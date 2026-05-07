@@ -32,6 +32,8 @@
   let integrationLoading = $state(false);
   let integrationError = $state<string | null>(null);
   let linkingIntegration = $state(false);
+  let selectedWatch = $state("");
+  let selectedClaw = $state("");
   let selectedTracker = $state("");
   let selectedPipeline = $state("");
   let trackerClaimRole = $state("coder");
@@ -92,15 +94,25 @@
       : "",
   );
   let supportsIntegration = $derived(
-    component === "nullboiler" || component === "nulltickets",
+    component === "nullclaw" ||
+      component === "nullwatch" ||
+      component === "nullboiler" ||
+      component === "nulltickets",
   );
   let supportsAgentData = $derived(component === "nullclaw");
+  let supportsChat = $derived(component === "nullclaw");
+  let supportsUsage = $derived(component === "nullclaw");
   let supportsVerboseStartup = $derived(component === "nullclaw");
   let instanceRouteKey = $derived(`${component}/${name}`);
   let initializedRouteKey = $state("");
   let queueSummary = $derived(summarizeQueue(integration?.queue));
   let linkedBoilers = $derived(integration?.linked_boilers || []);
   let trackerOptions = $derived(integration?.available_trackers || []);
+  let watchOptions = $derived(integration?.available_watches || []);
+  let linkedWatch = $derived(integration?.linked_watch || null);
+  let currentTelemetryLink = $derived(integration?.current_link || null);
+  let clawOptions = $derived(integration?.available_claws || []);
+  let linkedClaws = $derived(clawOptions.filter((claw: any) => claw?.linked));
   let selectedTrackerOption = $derived(
     trackerOptions.find((tracker: any) => tracker?.name === selectedTracker) || null,
   );
@@ -119,18 +131,24 @@
   let standaloneHomeEnv = $derived(componentHomeEnv(component));
   let standaloneHomePath = $derived(`$NULLHUB_HOME/instances/${component}/${name}`);
   let standaloneConfigPath = $derived(`${standaloneHomePath}/config.json`);
+  let hasStandaloneBinary = $derived(Boolean(instance?.version && instance.version !== "standalone"));
+  let standaloneBinaryName = $derived(
+    hasStandaloneBinary ? managedBinaryName(component, instance.version) : "",
+  );
   let standaloneBinaryPath = $derived(
-    instance?.version ? `$NULLHUB_HOME/bin/${component}-${instance.version}` : "",
+    standaloneBinaryName ? `$NULLHUB_HOME/bin/${standaloneBinaryName}` : "",
   );
   let standaloneLaunchScript = $derived(
-    buildStandaloneLaunchScript(
-      component,
-      name,
-      instance?.version,
-      instance?.launch_mode,
-      instance?.verbose,
-      standaloneHomeEnv,
-    ),
+    hasStandaloneBinary
+      ? buildStandaloneLaunchScript(
+          component,
+          name,
+          instance?.version,
+          instance?.launch_mode,
+          instance?.verbose,
+          standaloneHomeEnv,
+        )
+      : "",
   );
 
   function extractModel(cfg: any): string | null {
@@ -267,6 +285,7 @@
     if (componentName === "nullclaw") return "NULLCLAW_HOME";
     if (componentName === "nullboiler") return "NULLBOILER_HOME";
     if (componentName === "nulltickets") return "NULLTICKETS_HOME";
+    if (componentName === "nullwatch") return "NULLWATCH_HOME";
     return "COMPONENT_HOME";
   }
 
@@ -282,6 +301,35 @@
       .filter(Boolean);
   }
 
+  function defaultLaunchMode(componentName: string): string {
+    if (componentName === "nullwatch") return "serve";
+    return "gateway";
+  }
+
+  function managedBinaryName(componentName: string, version: string | undefined): string {
+    if (!version) return "";
+    if (version === "dev-local") return componentName;
+    return `${componentName}-${version}`;
+  }
+
+  function normalizedLaunchArgs(componentName: string, launchMode: string | undefined): string[] {
+    const args = tokenizeLaunchMode(launchMode || defaultLaunchMode(componentName));
+    if (args.length === 0) args.push(defaultLaunchMode(componentName));
+    if (componentName === "nullwatch" && args[0] === "nullwatch") {
+      args[0] = "serve";
+    }
+    return args;
+  }
+
+  function displayLaunchMode(launchMode: string | undefined): string {
+    const tokens = normalizedLaunchArgs(component, launchMode);
+    const primary = tokens[0] || defaultLaunchMode(component);
+    if (primary === "agent") return "Agent";
+    if (primary === "gateway") return "Gateway";
+    if (primary === "serve") return "Serve";
+    return primary;
+  }
+
   function buildStandaloneLaunchScript(
     componentName: string,
     instanceName: string,
@@ -292,12 +340,11 @@
   ): string {
     if (!version) return "";
 
-    const args = tokenizeLaunchMode(launchMode || "gateway");
-    if (args.length === 0) args.push("gateway");
+    const args = normalizedLaunchArgs(componentName, launchMode);
     if (verbose) args.push("--verbose");
 
     const command = [
-      `"$NULLHUB_HOME/bin/${componentName}-${version}"`,
+      `"$NULLHUB_HOME/bin/${managedBinaryName(componentName, version)}"`,
       ...args.map(shellQuote),
     ].join(" ");
 
@@ -415,6 +462,19 @@
           currentLink?.success_trigger || trackerSuccessTrigger || "complete";
         trackerConcurrency =
           String(currentLink?.max_concurrent_tasks || trackerConcurrency || "1");
+      } else if (component === "nullclaw") {
+        selectedWatch =
+          integration?.linked_watch?.name ||
+          selectedWatch ||
+          integration?.available_watches?.[0]?.name ||
+          "";
+      } else if (component === "nullwatch") {
+        const unlinked = integration?.available_claws?.find((claw: any) => !claw?.linked);
+        selectedClaw =
+          selectedClaw ||
+          unlinked?.name ||
+          integration?.available_claws?.[0]?.name ||
+          "";
       }
     } catch (e) {
       integration = null;
@@ -437,6 +497,30 @@
         max_concurrent_tasks: Math.max(1, Number(trackerConcurrency || "1") || 1),
       };
       await api.linkIntegration(component, name, payload);
+      await refresh();
+    } finally {
+      linkingIntegration = false;
+    }
+  }
+
+  async function linkNullWatch() {
+    if (component !== "nullclaw" || !selectedWatch) return;
+
+    linkingIntegration = true;
+    try {
+      await api.linkIntegration(component, name, { watch_instance: selectedWatch });
+      await refresh();
+    } finally {
+      linkingIntegration = false;
+    }
+  }
+
+  async function linkNullClawToWatch() {
+    if (component !== "nullwatch" || !selectedClaw) return;
+
+    linkingIntegration = true;
+    try {
+      await api.linkIntegration(component, name, { claw_instance: selectedClaw });
       await refresh();
     } finally {
       linkingIntegration = false;
@@ -469,6 +553,11 @@
   }
 
   async function refreshUsage(force = false) {
+    if (!supportsUsage) {
+      usageData = null;
+      usageLoading = false;
+      return;
+    }
     const now = Date.now();
     if (!force && now - lastUsageRefreshAt < 15_000) return;
     lastUsageRefreshAt = now;
@@ -538,6 +627,7 @@
 
   $effect(() => {
     usageWindow;
+    if (!supportsUsage) return;
     if (!component || !name) return;
     void refreshUsage(true);
   });
@@ -563,6 +653,9 @@
   $effect(() => {
     component;
     name;
+    if (activeTab === "chat" && !supportsChat) {
+      activeTab = "overview";
+    }
     if ((activeTab === "history" || activeTab === "memory" || activeTab === "skills") && !supportsAgentData) {
       activeTab = "overview";
     }
@@ -590,6 +683,10 @@
     usageData = null;
     integration = null;
     integrationError = null;
+    selectedWatch = "";
+    selectedClaw = "";
+    selectedTracker = "";
+    selectedPipeline = "";
     onboardingStatus = null;
     bootstrapChatAutoOpenedFor = "";
     lastUsageRefreshAt = 0;
@@ -690,9 +787,14 @@
     </div>
     <div class="actions">
       <button class="btn" onclick={start} disabled={loading}>Start</button>
-      <button class="btn" onclick={startAgent} disabled={loading}>Agent</button>
+      {#if supportsAgentData}
+        <button class="btn" onclick={startAgent} disabled={loading}>Agent</button>
+      {/if}
       <button class="btn" onclick={stop} disabled={loading}>Stop</button>
       <button class="btn" onclick={restart} disabled={loading}>Restart</button>
+      {#if component === "nullwatch"}
+        <a class="btn" href={`/observability?watch=${encodeURIComponent(name)}`}>Observability</a>
+      {/if}
       <button class="btn danger" onclick={remove} disabled={loading}
         >Delete</button
       >
@@ -704,13 +806,15 @@
       class:active={activeTab === "overview"}
       onclick={() => (activeTab = "overview")}>Overview</button
     >
-    <button
-      class:active={activeTab === "chat"}
-      class:disabled-tab={!chatReady}
-      onclick={() => (activeTab = "chat")}
-      >Chat{#if !providerStatus.configured}<span class="tab-warn">!</span
-        >{/if}</button
-    >
+    {#if supportsChat}
+      <button
+        class:active={activeTab === "chat"}
+        class:disabled-tab={!chatReady}
+        onclick={() => (activeTab = "chat")}
+        >Chat{#if !providerStatus.configured}<span class="tab-warn">!</span
+          >{/if}</button
+      >
+    {/if}
     {#if supportsAgentData}
       <button
         class:active={activeTab === "history"}
@@ -752,7 +856,7 @@
         </div>
         <div class="info-card">
           <span class="label">Launch Mode</span>
-          <span class="mode-value">{(instance?.launch_mode || "gateway") === "agent" ? "Agent" : "Gateway"}</span>
+          <span class="mode-value">{displayLaunchMode(instance?.launch_mode)}</span>
         </div>
         <div class="info-card">
           <span class="label">Auto Start</span>
@@ -834,9 +938,15 @@
           <div class="info-card integration-card">
             <div class="integration-header">
               <span class="label"
-                >{component === "nullboiler" ? "NullTickets Link" : "Linked NullBoilers"}</span
+                >{component === "nullclaw"
+                  ? "NullWatch Telemetry"
+                  : component === "nullwatch"
+                    ? "Observed NullClaws"
+                  : component === "nullboiler"
+                    ? "NullTickets Link"
+                    : "Linked NullBoilers"}</span
               >
-              {#if component === "nullboiler" && integration?.linked_tracker}
+              {#if (component === "nullboiler" && integration?.linked_tracker) || (component === "nullclaw" && linkedWatch) || (component === "nullwatch" && linkedClaws.length > 0)}
                 <span class="integration-badge">Linked</span>
               {/if}
             </div>
@@ -845,6 +955,130 @@
               <span class="integration-muted">Loading integration status...</span>
             {:else if integrationError}
               <span class="integration-error">{integrationError}</span>
+            {:else if component === "nullclaw"}
+              <div class="integration-block">
+                <span class="integration-title">Observer</span>
+                {#if linkedWatch}
+                  <span class="mono">{linkedWatch.name}:{linkedWatch.port}</span>
+                {:else if currentTelemetryLink}
+                  <span class="integration-muted mono">{currentTelemetryLink.endpoint}</span>
+                {:else}
+                  <span class="integration-muted">No NullWatch linked yet.</span>
+                {/if}
+              </div>
+
+              {#if currentTelemetryLink}
+                <div class="integration-block">
+                  <span class="integration-title">OTLP</span>
+                  <div class="integration-stats compact">
+                    <div>
+                      <span class="stat-label">Endpoint</span>
+                      <span class="mono">{currentTelemetryLink.endpoint}</span>
+                    </div>
+                    <div>
+                      <span class="stat-label">Service</span>
+                      <span class="mono">{currentTelemetryLink.service_name || "-"}</span>
+                    </div>
+                    <div>
+                      <span class="stat-label">Auth</span>
+                      <span>{currentTelemetryLink.auth_header ? "Bearer" : "None"}</span>
+                    </div>
+                    <div>
+                      <span class="stat-label">Source Header</span>
+                      <span>{currentTelemetryLink.source_header ? "On" : "Off"}</span>
+                    </div>
+                  </div>
+                </div>
+              {/if}
+
+              {#if watchOptions.length > 0}
+                <div class="integration-form">
+                  <label class="integration-field">
+                    <span>Local observer</span>
+                    <select bind:value={selectedWatch} disabled={linkingIntegration}>
+                      <option value="">Select NullWatch</option>
+                      {#each watchOptions as watch}
+                        <option value={watch.name}>
+                          {watch.name} ({watch.port}){watch.running ? "" : " - stopped"}
+                        </option>
+                      {/each}
+                    </select>
+                  </label>
+                  <button
+                    class="btn integration-btn"
+                    onclick={linkNullWatch}
+                    disabled={linkingIntegration || !selectedWatch}
+                  >
+                    {linkingIntegration
+                      ? "Linking..."
+                      : linkedWatch
+                        ? "Relink NullWatch"
+                        : "Link NullWatch"}
+                  </button>
+                  {#if linkedWatch}
+                    <a
+                      class="btn integration-btn"
+                      href={`/observability?watch=${encodeURIComponent(linkedWatch.name)}`}
+                      >Open Observability</a
+                    >
+                  {/if}
+                </div>
+              {:else}
+                <span class="integration-muted">Install NullWatch to link telemetry.</span>
+              {/if}
+            {:else if component === "nullwatch"}
+              <div class="integration-block">
+                <span class="integration-title">Linked NullClaws</span>
+                {#if linkedClaws.length > 0}
+                  <div class="integration-list">
+                    {#each linkedClaws as claw}
+                      <div class="integration-list-item">
+                        <div>
+                          <span class="integration-title">{claw.name}</span>
+                          <span class="integration-muted"
+                            >{claw.running ? "running" : "stopped"}</span
+                          >
+                        </div>
+                        <a class="btn integration-btn" href={`/instances/nullclaw/${encodeURIComponent(claw.name)}`}
+                          >Open</a
+                        >
+                      </div>
+                    {/each}
+                  </div>
+                {:else}
+                  <span class="integration-muted">No NullClaw instances linked yet.</span>
+                {/if}
+              </div>
+
+              {#if clawOptions.length > 0}
+                <div class="integration-form">
+                  <label class="integration-field">
+                    <span>Local NullClaw</span>
+                    <select bind:value={selectedClaw} disabled={linkingIntegration}>
+                      <option value="">Select NullClaw</option>
+                      {#each clawOptions as claw}
+                        <option value={claw.name}>
+                          {claw.name}{claw.linked ? " - linked" : ""}{claw.running ? "" : " - stopped"}
+                        </option>
+                      {/each}
+                    </select>
+                  </label>
+                  <button
+                    class="btn integration-btn"
+                    onclick={linkNullClawToWatch}
+                    disabled={linkingIntegration || !selectedClaw}
+                  >
+                    {linkingIntegration ? "Linking..." : "Link NullClaw"}
+                  </button>
+                  <a
+                    class="btn integration-btn"
+                    href={`/observability?watch=${encodeURIComponent(name)}`}
+                    >Open Observability</a
+                  >
+                </div>
+              {:else}
+                <span class="integration-muted">Install NullClaw to send telemetry here.</span>
+              {/if}
             {:else if component === "nullboiler"}
               <div class="integration-block">
                 <span class="integration-title">Tracker</span>
@@ -1038,56 +1272,58 @@
             {/if}
           </div>
         {/if}
-        <div class="info-card usage-card">
-          <div class="usage-header">
-            <span class="label">LLM Usage</span>
-            <select class="usage-window" bind:value={usageWindow}>
-              <option value="24h">24h</option>
-              <option value="7d">7d</option>
-              <option value="30d">30d</option>
-              <option value="all">All</option>
-            </select>
-          </div>
-          {#if usageLoading}
-            <span class="usage-empty">Loading usage...</span>
-          {:else if !usageData?.rows || usageData.rows.length === 0}
-            <span class="usage-empty">No usage data for selected window.</span>
-          {:else}
-            <div class="usage-table-wrap">
-              <table class="usage-table">
-                <thead>
-                  <tr>
-                    <th>Provider</th>
-                    <th>Model</th>
-                    <th>To provider (prompt)</th>
-                    <th>From provider (completion)</th>
-                    <th>Total</th>
-                    <th>Requests</th>
-                    <th>Last used</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {#each [...usageData.rows].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0)) as row}
+        {#if supportsUsage}
+          <div class="info-card usage-card">
+            <div class="usage-header">
+              <span class="label">LLM Usage</span>
+              <select class="usage-window" bind:value={usageWindow}>
+                <option value="24h">24h</option>
+                <option value="7d">7d</option>
+                <option value="30d">30d</option>
+                <option value="all">All</option>
+              </select>
+            </div>
+            {#if usageLoading}
+              <span class="usage-empty">Loading usage...</span>
+            {:else if !usageData?.rows || usageData.rows.length === 0}
+              <span class="usage-empty">No usage data for selected window.</span>
+            {:else}
+              <div class="usage-table-wrap">
+                <table class="usage-table">
+                  <thead>
                     <tr>
-                      <td>{row.provider}</td>
-                      <td class="mono">{row.model}</td>
-                      <td>{formatTokens(row.prompt_tokens)}</td>
-                      <td>{formatTokens(row.completion_tokens)}</td>
-                      <td>{formatTokens(row.total_tokens)}</td>
-                      <td>{row.requests || 0}</td>
-                      <td>{formatLastUsed(row.last_used)}</td>
+                      <th>Provider</th>
+                      <th>Model</th>
+                      <th>To provider (prompt)</th>
+                      <th>From provider (completion)</th>
+                      <th>Total</th>
+                      <th>Requests</th>
+                      <th>Last used</th>
                     </tr>
-                  {/each}
-                </tbody>
-              </table>
-            </div>
-          {/if}
-          {#if usageData?.totals}
-            <div class="usage-total">
-              Total: {formatTokens(usageData.totals.total_tokens)} tokens in {usageData.totals.requests || 0} request(s)
-            </div>
-          {/if}
-        </div>
+                  </thead>
+                  <tbody>
+                    {#each [...usageData.rows].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0)) as row}
+                      <tr>
+                        <td>{row.provider}</td>
+                        <td class="mono">{row.model}</td>
+                        <td>{formatTokens(row.prompt_tokens)}</td>
+                        <td>{formatTokens(row.completion_tokens)}</td>
+                        <td>{formatTokens(row.total_tokens)}</td>
+                        <td>{row.requests || 0}</td>
+                        <td>{formatLastUsed(row.last_used)}</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            {/if}
+            {#if usageData?.totals}
+              <div class="usage-total">
+                Total: {formatTokens(usageData.totals.total_tokens)} tokens in {usageData.totals.requests || 0} request(s)
+              </div>
+            {/if}
+          </div>
+        {/if}
       </div>
     {:else if activeTab === "history"}
       {#key instanceRouteKey}
@@ -1113,7 +1349,7 @@
       <div class="advanced-panel">
         <div class="advanced-card">
           <h3>Standalone Launch</h3>
-          {#if component === "nullclaw" && standaloneBinaryPath}
+          {#if standaloneBinaryPath}
             <p>
               Run this instance without <code>nullhub</code>, reusing the same
               config, auth, data, and logs directory.
@@ -1156,8 +1392,7 @@
             </p>
           {:else}
             <p>
-              Standalone launch instructions are available for <code>nullclaw</code>
-              instances for now.
+              Standalone launch instructions are available after this instance has a versioned binary.
             </p>
           {/if}
         </div>
@@ -1257,6 +1492,9 @@
     gap: 0.75rem;
   }
   .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     padding: 0.5rem 1rem;
     border: 1px solid var(--accent-dim);
     border-radius: 2px;
@@ -1269,6 +1507,7 @@
     cursor: pointer;
     transition: all 0.2s ease;
     text-shadow: var(--text-glow);
+    text-decoration: none;
   }
   .btn:hover {
     background: var(--bg-hover);
