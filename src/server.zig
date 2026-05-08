@@ -937,8 +937,12 @@ pub const Server = struct {
                 }
             }
             if (std.mem.eql(u8, method, "PUT")) {
-                if (settings_api.handlePutSettings(allocator, body)) |json| {
-                    return jsonResponse(json);
+                if (settings_api.handlePutSettings(allocator, body)) |resp| {
+                    return .{
+                        .status = resp.status,
+                        .content_type = resp.content_type,
+                        .body = resp.body,
+                    };
                 } else |_| {
                     return .{
                         .status = "500 Internal Server Error",
@@ -2483,6 +2487,16 @@ test "route PUT /api/settings returns ok" {
     defer std.testing.allocator.free(resp.body);
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ok\"") != null);
+}
+
+test "route PUT /api/settings rejects invalid JSON" {
+    var ctx = TestContext.init(std.testing.allocator);
+    defer ctx.deinit(std.testing.allocator);
+
+    const resp = ctx.route(std.testing.allocator, "PUT", "/api/settings", "not json");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"error\":\"invalid JSON body\"") != null);
 }
 
 test "route POST /api/service/install returns platform info" {
