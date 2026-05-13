@@ -5,7 +5,6 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "/bin/sh -c \"exec nullhub serve --host 0.0.0.0 --port ${PORT:-19800}\"",
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE",
