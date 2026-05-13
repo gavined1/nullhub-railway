@@ -35,8 +35,8 @@ COPY src/ src/
 COPY --from=ui-builder /ui/build ui/build
 
 ARG TARGETARCH
-RUN --mount=type=cache,target=/root/.cache/zig \
-    --mount=type=cache,target=/app/.zig-cache \
+RUN --mount=type=cache,id=s/57f8046d-1ab2-47d4-b40f-a4a12627eb04-/root/.cache/zig,target=/root/.cache/zig \
+    --mount=type=cache,id=s/57f8046d-1ab2-47d4-b40f-a4a12627eb04-/app/.zig-cache,target=/app/.zig-cache \
     set -eu; \
     arch="${TARGETARCH:-}"; \
     if [ -z "${arch}" ]; then \
