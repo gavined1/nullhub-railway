@@ -67,8 +67,7 @@ COPY --from=builder /app/zig-out/bin/nullhub /usr/local/bin/nullhub
 ENV HOME=/nullhub-data
 WORKDIR /opt/nullhub
 EXPOSE 19800
-ENTRYPOINT ["nullhub"]
-CMD ["serve", "--host", "0.0.0.0", "--port", "19800"]
+CMD ["/bin/sh", "-c", "exec nullhub serve --host 0.0.0.0 --port ${PORT:-19800}"]
 
 # Optional autonomous mode (explicit opt-in):
 #   docker build --target release-root -t nullhub:root .
